@@ -83,6 +83,19 @@ The crate includes a `download-native` feature (enabled by default) that automat
 
 These libraries are automatically downloaded to the crate's `prebuilt/` directory during the first build. No manual setup is required.
 
+### Using in another project
+
+If you use this crate as a **path dependency** in another workspace, copy the DLLs and `.if.lib` from the `prebuilt/` folder into your local copy of the crate. The `build.rs` looks for them in these directories (in order):
+
+1. The `LITERT_LM_LIB_DIR` environment variable
+2. `<build_out>/prebuilt/` (auto-downloaded location)
+3. `<crate_dir>/prebuilt/` — **easiest: just copy files here**
+4. `<crate_dir>/native/`
+5. `<crate_dir>/c/`
+6. `<crate_dir>/c/build/`
+
+At runtime the DLLs must also be on `PATH` or next to the executable.
+
 ### Manual Setup
 
 If you prefer to build the LiteRT-LM C API from source:
