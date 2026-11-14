@@ -1,0 +1,115 @@
+name: Update Bindings from Upstream
+
+on:
+  push:
+    branches: [master]
+  schedule:
+    # Perpetual auto-update: every 3 days at 05:23 UTC.
+    - cron: '23 5 */3 * *'
+  workflow_dispatch:
+
+# Serialize runs so concurrent triggers never race on the same commit.
+concurrency:
+  group: update-bindings
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout litert-lm-rust
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Automatic runs (push + schedule) update at most once per 3 days.
+      # workflow_dispatch bypasses the limit (accelerated / manual runs).
+      - name: Rate limit (max one auto-update per 3 days)
+        id: rate
+        if: github.event_name != 'workflow_dispatch'
+        run: |
+          set -eux
+          last=$(git log -1 --format=%cI --grep='chore(bindings): auto-sync' || true)
+          if [ -z "$last" ]; then
+            echo "No previous auto-sync commit; proceeding."
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          last_ts=$(date -d "$last" +%s)
+          now_ts=$(date +%s)
+          age_days=$(( (now_ts - last_ts) / 86400 ))
+          echo "Last auto-sync: $last ($age_days day(s) ago)"
+          if [ "$age_days" -lt 3 ]; then
+            echo "Rate limit hit: at most one automatic update per 3 days. Skipping."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout LiteRT-LM (upstream)
+        if: steps.rate.outputs.skip != 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: google-ai-edge/LiteRT-LM
+          path: upstream
+          fetch-depth: 1
+
+      - name: Install libclang
+        if: steps.rate.outputs.skip != 'true'
+        run: |
+          set -eux
+          sudo apt-get update
+          sudo apt-get install -y llvm libclang-dev
+          llvm-config --libdir
+
+      - name: Install Rust
+        if: steps.rate.outputs.skip != 'true'
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Sync C API headers from upstream
+        if: steps.rate.outputs.skip != 'true'
+        run: |
+          set -eux
+          UPSTREAM_SHA=$(git -C upstream rev-parse HEAD)
+          echo "Upstream google-ai-edge/LiteRT-LM @ ${UPSTREAM_SHA}"
+          cp upstream/c/engine.h upstream/c/conversation.h \
+             upstream/c/api_export.h upstream/c/error_reporter.h c/
+          for f in engine.h conversation.h api_export.h error_reporter.h; do
+            echo "c/${f}: $(wc -c < c/${f}) bytes, sha256=$(sha256sum c/${f} | cut -d' ' -f1)"
+          done
+          echo "UPSTREAM_SHA=${UPSTREAM_SHA}" >> "$GITHUB_ENV"
+
+      - name: Regenerate FFI bindings (bindgen)
+        if: steps.rate.outputs.skip != 'true'
+        run: |
+          set -eux
+          export LIBCLANG_PATH="$(llvm-config --libdir)"
+          echo "LIBCLANG_PATH=${LIBCLANG_PATH}"
+          cargo build --no-default-features --features bindgen,docs-only
+          echo "src/bindings.rs regenerated: $(wc -l < src/bindings.rs) lines"
+
+      - name: Verify (cargo check all targets)
+        if: steps.rate.outputs.skip != 'true'
+        run: |
+          set -eux
+          cargo check --all-targets --no-default-features --features docs-only
+
+      - name: Commit and push if changed
+        if: steps.rate.outputs.skip != 'true'
+        run: |
+          set -eux
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add c/engine.h c/conversation.h c/api_export.h c/error_reporter.h src/bindings.rs
+          if git diff --cached --quiet; then
+            echo "No changes: bindings already up to date with upstream ${UPSTREAM_SHA}."
+            exit 0
+          fi
+          git commit -m "chore(bindings): auto-sync with upstream LiteRT-LM (${UPSTREAM_SHA})"
+          git pull --rebase origin master
+          git push origin master
+          echo "Pushed auto-sync commit for upstream ${UPSTREAM_SHA}."

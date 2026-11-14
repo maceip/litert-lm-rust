@@ -177,6 +177,8 @@ cargo build --features bindgen,docs-only
 
 This updates `src/bindings.rs` from `c/wrapper.h` / `c/engine.h` / `c/conversation.h`.
 
+Bindings also stay in sync automatically via GitHub Actions (`update-bindings.yml`): on every push and on a 3-day schedule the C API headers are re-synced from upstream LiteRT-LM and `src/bindings.rs` is regenerated, committing only when something changed. Automatic runs are rate-limited to at most one update per 3 days; `workflow_dispatch` runs the full sync immediately (accelerated).
+
 ## Publish
 
 ```bash
