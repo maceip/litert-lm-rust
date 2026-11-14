@@ -8,5 +8,6 @@
 #endif
 
 #include "engine.h"
+#include "conversation.h"
 
 #endif /* LITERT_LM_RUST_WRAPPER_H_ */

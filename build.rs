@@ -23,6 +23,9 @@ fn main() {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
 
     println!("cargo:rerun-if-changed=c/engine.h");
+    println!("cargo:rerun-if-changed=c/conversation.h");
+    println!("cargo:rerun-if-changed=c/api_export.h");
+    println!("cargo:rerun-if-changed=c/error_reporter.h");
     println!("cargo:rerun-if-changed=c/wrapper.h");
     println!("cargo:rerun-if-changed=src/bindings.rs");
     println!("cargo:rerun-if-env-changed=LITERT_LM_LIB_DIR");
@@ -78,9 +81,13 @@ fn main() {
 #[cfg(feature = "bindgen")]
 fn generate_bindings(include_dir: &PathBuf, bindings_path: &PathBuf) {
     let wrapper = include_dir.join("wrapper.h");
+    // Upstream headers include either "api_export.h" (Apple) or
+    // "c/api_export.h" (other platforms); both resolve when the include dir
+    // and its parent are on the search path.
     let bindings = bindgen::Builder::default()
         .header(wrapper.to_string_lossy())
         .clang_arg(format!("-I{}", include_dir.display()))
+        .clang_arg(format!("-I{}", include_dir.parent().unwrap().display()))
         .clang_arg("-DLITERT_LM_C_API_EXPORT=")
         .allowlist_function("litert_lm_.*")
         .allowlist_type("LiteRtLm.*")
