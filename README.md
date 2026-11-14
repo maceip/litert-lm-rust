@@ -2,7 +2,7 @@
 
 Safe, idiomatic Rust bindings for [LiteRT-LM](https://github.com/google-ai-edge/LiteRT-LM) — Google's on-device LLM runtime.
 
-This crate wraps the stable **C API** (`c/engine.h`), which is the supported FFI surface for the C++ Conversation / Engine stack described in [`litert.md`](./litert.md).
+This crate wraps the stable **C API** (`c/engine.h` + `c/conversation.h`), which is the supported FFI surface for the C++ Conversation / Engine stack described in [`litert.md`](./litert.md). The headers are synced with upstream LiteRT-LM C API **v1.1.0** (status-code ABI).
 
 ## Features
 
@@ -18,7 +18,7 @@ This crate wraps the stable **C API** (`c/engine.h`), which is the supported FFI
 
 ```toml
 [dependencies]
-litert-lm-rust = "0.2.3"
+litert-lm-rust = "0.3.0"
 ```
 
 The crate will automatically download the required native libraries from GitHub releases on first build (Windows only). No manual setup is required for most use cases.
@@ -175,7 +175,7 @@ cargo run --example mtp -- model.litertlm
 cargo build --features bindgen,docs-only
 ```
 
-This updates `src/bindings.rs` from `c/wrapper.h` / `c/engine.h`.
+This updates `src/bindings.rs` from `c/wrapper.h` / `c/engine.h` / `c/conversation.h`.
 
 ## Publish
 

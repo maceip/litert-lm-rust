@@ -6,7 +6,7 @@ use std::ptr::NonNull;
 use serde_json::Value;
 
 use crate::engine::{Engine, EngineLifetime};
-use crate::error::{Error, Result};
+use crate::error::{check, Error, Result};
 use crate::ffi;
 use crate::message::Message;
 use crate::session::RawSessionConfig;
@@ -90,6 +90,8 @@ pub struct ConversationOptionalArgs {
     pub thinking: Option<ThinkingConfig>,
     pub constraint_type: Option<ConstraintType>,
     pub constraint_string: Option<String>,
+    /// Tool choice JSON (e.g. `{"type": "auto"}`).
+    pub tool_choice: Option<Value>,
 }
 
 /// Options passed alongside a message.
@@ -110,9 +112,17 @@ unsafe impl Send for Conversation<'_> {}
 impl<'engine> Conversation<'engine> {
     pub(crate) fn new(engine: &'engine Engine, config: ConversationConfig) -> Result<Self> {
         let raw_config = RawConversationConfig::new(config)?;
-        let raw = unsafe {
-            ffi::litert_lm_conversation_create(engine.raw().as_ptr(), raw_config.as_mut_ptr())
-        };
+        let mut raw = std::ptr::null_mut();
+        check(
+            "litert_lm_conversation_create",
+            unsafe {
+                ffi::litert_lm_conversation_create(
+                    engine.raw().as_ptr(),
+                    raw_config.as_mut_ptr(),
+                    &mut raw,
+                )
+            },
+        )?;
         let raw =
             NonNull::new(raw).ok_or(Error::NullPointer("litert_lm_conversation_create"))?;
         Ok(Self {
@@ -142,24 +152,33 @@ impl<'engine> Conversation<'engine> {
             .map(RawOptionalArgs::new)
             .transpose()?;
 
-        let response = unsafe {
-            ffi::litert_lm_conversation_send_message(
-                self.raw.as_ptr(),
-                message_json.as_ptr(),
-                extra
-                    .as_ref()
-                    .map(|c| c.as_ptr())
-                    .unwrap_or(std::ptr::null()),
-                opt_args
-                    .as_ref()
-                    .map(|a| a.as_ptr())
-                    .unwrap_or(std::ptr::null()),
-            )
-        };
+        let mut response = std::ptr::null_mut();
+        check(
+            "litert_lm_conversation_send_message",
+            unsafe {
+                ffi::litert_lm_conversation_send_message(
+                    self.raw.as_ptr(),
+                    message_json.as_ptr(),
+                    extra
+                        .as_ref()
+                        .map(|c| c.as_ptr())
+                        .unwrap_or(std::ptr::null()),
+                    opt_args
+                        .as_ref()
+                        .map(|a| a.as_ptr())
+                        .unwrap_or(std::ptr::null()),
+                    &mut response,
+                )
+            },
+        )?;
         let response = NonNull::new(response)
             .ok_or(Error::NullPointer("litert_lm_conversation_send_message"))?;
         let json = unsafe {
-            let ptr = ffi::litert_lm_json_response_get_string(response.as_ptr());
+            let mut ptr: *const std::os::raw::c_char = std::ptr::null();
+            check(
+                "litert_lm_json_response_get_string",
+                ffi::litert_lm_json_response_get_string(response.as_ptr(), &mut ptr),
+            )?;
             let s = if ptr.is_null() {
                 "{}".to_owned()
             } else {
@@ -208,8 +227,20 @@ impl<'engine> Conversation<'engine> {
         )
     }
 
+    /// Block until any in-flight streaming work on this conversation is done.
+    pub fn wait_until_done(&mut self) -> Result<()> {
+        check(
+            "litert_lm_conversation_wait_until_done",
+            unsafe { ffi::litert_lm_conversation_wait_until_done(self.raw.as_ptr()) },
+        )
+    }
+
     pub fn clone_conversation(&self) -> Result<Conversation<'engine>> {
-        let raw = unsafe { ffi::litert_lm_conversation_clone(self.raw.as_ptr()) };
+        let mut raw = std::ptr::null_mut();
+        check(
+            "litert_lm_conversation_clone",
+            unsafe { ffi::litert_lm_conversation_clone(self.raw.as_ptr(), &mut raw) },
+        )?;
         let raw =
             NonNull::new(raw).ok_or(Error::NullPointer("litert_lm_conversation_clone"))?;
         Ok(Conversation {
@@ -218,26 +249,37 @@ impl<'engine> Conversation<'engine> {
         })
     }
 
-    pub fn cancel_process(&mut self) {
-        unsafe { ffi::litert_lm_conversation_cancel_process(self.raw.as_ptr()) };
+    pub fn cancel_process(&mut self) -> Result<()> {
+        check(
+            "litert_lm_conversation_cancel_process",
+            unsafe { ffi::litert_lm_conversation_cancel_process(self.raw.as_ptr()) },
+        )
     }
 
-    pub fn token_count(&self) -> Result<i32> {
-        let n = unsafe { ffi::litert_lm_conversation_get_token_count(self.raw.as_ptr()) };
-        if n < 0 {
-            return Err(Error::NativeStatus(
-                "litert_lm_conversation_get_token_count",
-                n,
-            ));
-        }
-        Ok(n)
+    pub fn token_count(&self) -> Result<usize> {
+        let mut out = 0;
+        check(
+            "litert_lm_conversation_get_token_count",
+            unsafe {
+                ffi::litert_lm_conversation_get_token_count(self.raw.as_ptr(), &mut out)
+            },
+        )?;
+        Ok(out)
     }
 
     pub fn render_message(&self, message: &Message) -> Result<String> {
         let json = CString::new(message.to_json_string()?)?;
-        let ptr = unsafe {
-            ffi::litert_lm_conversation_render_message_to_string(self.raw.as_ptr(), json.as_ptr())
-        };
+        let mut ptr: *const std::os::raw::c_char = std::ptr::null();
+        check(
+            "litert_lm_conversation_render_message_to_string",
+            unsafe {
+                ffi::litert_lm_conversation_render_message_to_string(
+                    self.raw.as_ptr(),
+                    json.as_ptr(),
+                    &mut ptr,
+                )
+            },
+        )?;
         if ptr.is_null() {
             return Err(Error::NullPointer(
                 "litert_lm_conversation_render_message_to_string",
@@ -247,8 +289,13 @@ impl<'engine> Conversation<'engine> {
     }
 
     pub fn render_preface(&self) -> Result<String> {
-        let ptr =
-            unsafe { ffi::litert_lm_conversation_render_preface_to_string(self.raw.as_ptr()) };
+        let mut ptr: *const std::os::raw::c_char = std::ptr::null();
+        check(
+            "litert_lm_conversation_render_preface_to_string",
+            unsafe {
+                ffi::litert_lm_conversation_render_preface_to_string(self.raw.as_ptr(), &mut ptr)
+            },
+        )?;
         if ptr.is_null() {
             return Err(Error::NullPointer(
                 "litert_lm_conversation_render_preface_to_string",
@@ -258,7 +305,13 @@ impl<'engine> Conversation<'engine> {
     }
 
     pub fn benchmark_info(&self) -> Result<crate::BenchmarkInfo> {
-        let raw = unsafe { ffi::litert_lm_conversation_get_benchmark_info(self.raw.as_ptr()) };
+        let mut raw = std::ptr::null_mut();
+        check(
+            "litert_lm_conversation_get_benchmark_info",
+            unsafe {
+                ffi::litert_lm_conversation_get_benchmark_info(self.raw.as_ptr(), &mut raw)
+            },
+        )?;
         let raw = NonNull::new(raw)
             .ok_or(Error::NullPointer("litert_lm_conversation_get_benchmark_info"))?;
         Ok(crate::BenchmarkInfo { raw })
@@ -299,71 +352,116 @@ impl RawConversationConfig {
             });
         }
 
-        let raw = unsafe { ffi::litert_lm_conversation_config_create() };
+        let mut raw = std::ptr::null_mut();
+        check(
+            "litert_lm_conversation_config_create",
+            unsafe { ffi::litert_lm_conversation_config_create(&mut raw) },
+        )?;
         let raw = NonNull::new(raw)
             .ok_or(Error::NullPointer("litert_lm_conversation_config_create"))?;
 
         unsafe {
             if let Some(sc) = session.as_ptr() {
-                ffi::litert_lm_conversation_config_set_session_config(raw.as_ptr(), sc.as_ptr());
+                check(
+                    "litert_lm_conversation_config_set_session_config",
+                    ffi::litert_lm_conversation_config_set_session_config(
+                        raw.as_ptr(),
+                        sc.as_ptr(),
+                    ),
+                )?;
             }
             if let Some(ref msg) = config.system_message {
                 let c = CString::new(serde_json::to_string(msg)?)?;
-                ffi::litert_lm_conversation_config_set_system_message(raw.as_ptr(), c.as_ptr());
+                check(
+                    "litert_lm_conversation_config_set_system_message",
+                    ffi::litert_lm_conversation_config_set_system_message(
+                        raw.as_ptr(),
+                        c.as_ptr(),
+                    ),
+                )?;
             }
             if let Some(ref tools) = config.tools {
                 let c = CString::new(serde_json::to_string(tools)?)?;
-                ffi::litert_lm_conversation_config_set_tools(raw.as_ptr(), c.as_ptr());
+                check(
+                    "litert_lm_conversation_config_set_tools",
+                    ffi::litert_lm_conversation_config_set_tools(raw.as_ptr(), c.as_ptr()),
+                )?;
             }
             if let Some(ref messages) = config.messages {
                 let c = CString::new(serde_json::to_string(messages)?)?;
-                ffi::litert_lm_conversation_config_set_messages(raw.as_ptr(), c.as_ptr());
+                check(
+                    "litert_lm_conversation_config_set_messages",
+                    ffi::litert_lm_conversation_config_set_messages(raw.as_ptr(), c.as_ptr()),
+                )?;
             }
             if let Some(ref extra) = config.extra_context {
                 let c = CString::new(serde_json::to_string(extra)?)?;
-                ffi::litert_lm_conversation_config_set_extra_context(raw.as_ptr(), c.as_ptr());
+                check(
+                    "litert_lm_conversation_config_set_extra_context",
+                    ffi::litert_lm_conversation_config_set_extra_context(raw.as_ptr(), c.as_ptr()),
+                )?;
             }
             if let Some(ref tmpl) = config.prompt_template {
                 let c = CString::new(tmpl.as_str())?;
-                ffi::litert_lm_conversation_config_set_prompt_template(raw.as_ptr(), c.as_ptr());
+                check(
+                    "litert_lm_conversation_config_set_prompt_template",
+                    ffi::litert_lm_conversation_config_set_prompt_template(
+                        raw.as_ptr(),
+                        c.as_ptr(),
+                    ),
+                )?;
             }
             if let Some(v) = config.enable_constrained_decoding {
-                ffi::litert_lm_conversation_config_set_enable_constrained_decoding(
-                    raw.as_ptr(),
-                    v,
-                );
+                check(
+                    "litert_lm_conversation_config_set_enable_constrained_decoding",
+                    ffi::litert_lm_conversation_config_set_enable_constrained_decoding(
+                        raw.as_ptr(),
+                        v,
+                    ),
+                )?;
             }
             if config.use_ll_guidance == Some(true) {
-                let provider = ffi::LiteRtLmConstraintProviderType_kLiteRtLmConstraintProviderTypeLlGuidance;
-                ffi::litert_lm_conversation_config_set_constraint_provider(
-                    raw.as_ptr(),
-                    &provider,
-                );
+                check(
+                    "litert_lm_conversation_config_set_constraint_provider",
+                    ffi::litert_lm_conversation_config_set_constraint_provider(
+                        raw.as_ptr(),
+                        ffi::LiteRtLmConstraintProviderType_kLiteRtLmConstraintProviderTypeLlGuidance,
+                    ),
+                )?;
             }
             if let Some(v) = config.filter_channel_content_from_kv_cache {
-                ffi::litert_lm_conversation_config_set_filter_channel_content_from_kv_cache(
-                    raw.as_ptr(),
-                    v,
-                );
+                check(
+                    "litert_lm_conversation_config_set_filter_channel_content_from_kv_cache",
+                    ffi::litert_lm_conversation_config_set_filter_channel_content_from_kv_cache(
+                        raw.as_ptr(),
+                        v,
+                    ),
+                )?;
             }
             if let Some((enabled, ref channel)) = config.stream_tool_calls {
                 let c = CString::new(channel.as_str())?;
-                ffi::litert_lm_conversation_config_set_stream_tool_calls(
-                    raw.as_ptr(),
-                    enabled,
-                    c.as_ptr(),
-                );
+                check(
+                    "litert_lm_conversation_config_set_stream_tool_calls",
+                    ffi::litert_lm_conversation_config_set_stream_tool_calls(
+                        raw.as_ptr(),
+                        enabled,
+                        c.as_ptr(),
+                    ),
+                )?;
             }
         }
 
         let thinking = if let Some(t) = config.thinking {
             let raw_t = RawThinkingConfig::new(t)?;
-            unsafe {
-                ffi::litert_lm_conversation_config_set_thinking_config(
-                    raw.as_ptr(),
-                    raw_t.as_ptr(),
-                );
-            }
+            check(
+                "litert_lm_conversation_config_set_thinking_config",
+                unsafe {
+                    ffi::litert_lm_conversation_config_set_thinking_config(
+                        raw.as_ptr(),
+                        raw_t.as_ptr(),
+                    )
+                },
+            )?;
             Some(raw_t)
         } else {
             None
@@ -395,15 +493,25 @@ struct RawThinkingConfig {
 
 impl RawThinkingConfig {
     fn new(config: ThinkingConfig) -> Result<Self> {
-        let raw = unsafe { ffi::litert_lm_thinking_config_create() };
+        let mut raw = std::ptr::null_mut();
+        check(
+            "litert_lm_thinking_config_create",
+            unsafe { ffi::litert_lm_thinking_config_create(&mut raw) },
+        )?;
         let raw =
             NonNull::new(raw).ok_or(Error::NullPointer("litert_lm_thinking_config_create"))?;
         unsafe {
             if let Some(v) = config.enable_thinking {
-                ffi::litert_lm_thinking_config_set_enable_thinking(raw.as_ptr(), v);
+                check(
+                    "litert_lm_thinking_config_set_enable_thinking",
+                    ffi::litert_lm_thinking_config_set_enable_thinking(raw.as_ptr(), v),
+                )?;
             }
             if let Some(v) = config.thinking_token_budget {
-                ffi::litert_lm_thinking_config_set_thinking_token_budget(raw.as_ptr(), v);
+                check(
+                    "litert_lm_thinking_config_set_thinking_token_budget",
+                    ffi::litert_lm_thinking_config_set_thinking_token_budget(raw.as_ptr(), v),
+                )?;
             }
         }
         Ok(Self { raw })
@@ -453,7 +561,11 @@ impl Drop for OwnedNative {
 
 impl RawOptionalArgs {
     fn new(args: ConversationOptionalArgs) -> Result<Self> {
-        let raw = unsafe { ffi::litert_lm_conversation_optional_args_create() };
+        let mut raw = std::ptr::null_mut();
+        check(
+            "litert_lm_conversation_optional_args_create",
+            unsafe { ffi::litert_lm_conversation_optional_args_create(&mut raw) },
+        )?;
         let raw = NonNull::new(raw).ok_or(Error::NullPointer(
             "litert_lm_conversation_optional_args_create",
         ))?;
@@ -461,83 +573,165 @@ impl RawOptionalArgs {
 
         unsafe {
             if let Some(cfg) = args.repetition_penalty {
-                let p = ffi::litert_lm_repetition_penalty_config_create();
+                let mut p = std::ptr::null_mut();
+                check(
+                    "litert_lm_repetition_penalty_config_create",
+                    ffi::litert_lm_repetition_penalty_config_create(&mut p),
+                )?;
                 let p = NonNull::new(p).ok_or(Error::NullPointer(
                     "litert_lm_repetition_penalty_config_create",
                 ))?;
                 if let Some(v) = cfg.repetition_penalty {
-                    ffi::litert_lm_repetition_penalty_config_set_repetition_penalty(p.as_ptr(), v);
+                    check(
+                        "litert_lm_repetition_penalty_config_set_repetition_penalty",
+                        ffi::litert_lm_repetition_penalty_config_set_repetition_penalty(
+                            p.as_ptr(),
+                            v,
+                        ),
+                    )?;
                 }
                 if let Some(v) = cfg.presence_penalty {
-                    ffi::litert_lm_repetition_penalty_config_set_presence_penalty(p.as_ptr(), v);
+                    check(
+                        "litert_lm_repetition_penalty_config_set_presence_penalty",
+                        ffi::litert_lm_repetition_penalty_config_set_presence_penalty(
+                            p.as_ptr(),
+                            v,
+                        ),
+                    )?;
                 }
                 if let Some(v) = cfg.frequency_penalty {
-                    ffi::litert_lm_repetition_penalty_config_set_frequency_penalty(p.as_ptr(), v);
+                    check(
+                        "litert_lm_repetition_penalty_config_set_frequency_penalty",
+                        ffi::litert_lm_repetition_penalty_config_set_frequency_penalty(
+                            p.as_ptr(),
+                            v,
+                        ),
+                    )?;
                 }
                 if let Some(v) = cfg.window_size {
-                    ffi::litert_lm_repetition_penalty_config_set_window_size(p.as_ptr(), v);
+                    check(
+                        "litert_lm_repetition_penalty_config_set_window_size",
+                        ffi::litert_lm_repetition_penalty_config_set_window_size(p.as_ptr(), v),
+                    )?;
                 }
-                ffi::litert_lm_conversation_optional_args_set_repetition_penalty_config(
-                    raw.as_ptr(),
-                    p.as_ptr(),
-                );
+                check(
+                    "litert_lm_conversation_optional_args_set_repetition_penalty_config",
+                    ffi::litert_lm_conversation_optional_args_set_repetition_penalty_config(
+                        raw.as_ptr(),
+                        p.as_ptr(),
+                    ),
+                )?;
                 owned.push(OwnedNative::Repetition(p));
             }
             if let Some(cfg) = args.no_repeat_ngram {
-                let p = ffi::litert_lm_no_repeat_ngram_config_create();
+                let mut p = std::ptr::null_mut();
+                check(
+                    "litert_lm_no_repeat_ngram_config_create",
+                    ffi::litert_lm_no_repeat_ngram_config_create(&mut p),
+                )?;
                 let p = NonNull::new(p).ok_or(Error::NullPointer(
                     "litert_lm_no_repeat_ngram_config_create",
                 ))?;
                 if let Some(v) = cfg.no_repeat_ngram_size {
-                    ffi::litert_lm_no_repeat_ngram_config_set_no_repeat_ngram_size(p.as_ptr(), v);
+                    check(
+                        "litert_lm_no_repeat_ngram_config_set_no_repeat_ngram_size",
+                        ffi::litert_lm_no_repeat_ngram_config_set_no_repeat_ngram_size(
+                            p.as_ptr(),
+                            v,
+                        ),
+                    )?;
                 }
                 if let Some(v) = cfg.window_size {
-                    ffi::litert_lm_no_repeat_ngram_config_set_window_size(p.as_ptr(), v);
+                    check(
+                        "litert_lm_no_repeat_ngram_config_set_window_size",
+                        ffi::litert_lm_no_repeat_ngram_config_set_window_size(p.as_ptr(), v),
+                    )?;
                 }
-                ffi::litert_lm_conversation_optional_args_set_no_repeat_ngram_config(
-                    raw.as_ptr(),
-                    p.as_ptr(),
-                );
+                check(
+                    "litert_lm_conversation_optional_args_set_no_repeat_ngram_config",
+                    ffi::litert_lm_conversation_optional_args_set_no_repeat_ngram_config(
+                        raw.as_ptr(),
+                        p.as_ptr(),
+                    ),
+                )?;
                 owned.push(OwnedNative::NoRepeat(p));
             }
             if let Some(cfg) = args.suppress_tokens {
-                let p = ffi::litert_lm_suppress_tokens_config_create();
+                let mut p = std::ptr::null_mut();
+                check(
+                    "litert_lm_suppress_tokens_config_create",
+                    ffi::litert_lm_suppress_tokens_config_create(&mut p),
+                )?;
                 let p = NonNull::new(p).ok_or(Error::NullPointer(
                     "litert_lm_suppress_tokens_config_create",
                 ))?;
-                ffi::litert_lm_suppress_tokens_config_set_suppress_tokens(
-                    p.as_ptr(),
-                    cfg.tokens.as_ptr(),
-                    cfg.tokens.len(),
-                );
-                ffi::litert_lm_conversation_optional_args_set_suppress_tokens_config(
-                    raw.as_ptr(),
-                    p.as_ptr(),
-                );
+                check(
+                    "litert_lm_suppress_tokens_config_set_suppress_tokens",
+                    ffi::litert_lm_suppress_tokens_config_set_suppress_tokens(
+                        p.as_ptr(),
+                        cfg.tokens.as_ptr(),
+                        cfg.tokens.len(),
+                    ),
+                )?;
+                check(
+                    "litert_lm_conversation_optional_args_set_suppress_tokens_config",
+                    ffi::litert_lm_conversation_optional_args_set_suppress_tokens_config(
+                        raw.as_ptr(),
+                        p.as_ptr(),
+                    ),
+                )?;
                 owned.push(OwnedNative::Suppress(p));
             }
             if let Some(v) = args.visual_token_budget {
-                ffi::litert_lm_conversation_optional_args_set_visual_token_budget(raw.as_ptr(), v);
+                check(
+                    "litert_lm_conversation_optional_args_set_visual_token_budget",
+                    ffi::litert_lm_conversation_optional_args_set_visual_token_budget(
+                        raw.as_ptr(),
+                        v,
+                    ),
+                )?;
             }
             if let Some(v) = args.max_output_tokens {
-                ffi::litert_lm_conversation_optional_args_set_max_output_tokens(raw.as_ptr(), v);
+                check(
+                    "litert_lm_conversation_optional_args_set_max_output_tokens",
+                    ffi::litert_lm_conversation_optional_args_set_max_output_tokens(
+                        raw.as_ptr(),
+                        v,
+                    ),
+                )?;
             }
             if let Some(t) = args.thinking {
                 let raw_t = RawThinkingConfig::new(t)?;
-                ffi::litert_lm_conversation_optional_args_set_thinking_config(
-                    raw.as_ptr(),
-                    raw_t.as_ptr(),
-                );
+                check(
+                    "litert_lm_conversation_optional_args_set_thinking_config",
+                    ffi::litert_lm_conversation_optional_args_set_thinking_config(
+                        raw.as_ptr(),
+                        raw_t.as_ptr(),
+                    ),
+                )?;
                 owned.push(OwnedNative::Thinking(raw_t));
             }
             if let Some(ty) = args.constraint_type {
                 let s = args.constraint_string.unwrap_or_default();
                 let c = CString::new(s)?;
-                ffi::litert_lm_conversation_optional_args_set_constraint(
-                    raw.as_ptr(),
-                    ty.into_ffi(),
-                    c.as_ptr(),
-                );
+                check(
+                    "litert_lm_conversation_optional_args_set_constraint",
+                    ffi::litert_lm_conversation_optional_args_set_constraint(
+                        raw.as_ptr(),
+                        ty.into_ffi(),
+                        c.as_ptr(),
+                    ),
+                )?;
+            }
+            if let Some(ref choice) = args.tool_choice {
+                let c = CString::new(serde_json::to_string(choice)?)?;
+                check(
+                    "litert_lm_conversation_optional_args_set_tool_choice",
+                    ffi::litert_lm_conversation_optional_args_set_tool_choice(
+                        raw.as_ptr(),
+                        c.as_ptr(),
+                    ),
+                )?;
             }
         }
 

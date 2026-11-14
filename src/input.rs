@@ -48,13 +48,18 @@ impl OwnedInputs {
         let mut ptrs = Vec::with_capacity(inputs.len());
         for input in inputs {
             let bytes = input.bytes();
-            let raw = unsafe {
-                ffi::litert_lm_input_data_create(
-                    input.ffi_type(),
-                    bytes.as_ptr().cast(),
-                    bytes.len(),
-                )
-            };
+            let mut raw = std::ptr::null_mut();
+            crate::error::check(
+                "litert_lm_input_data_create",
+                unsafe {
+                    ffi::litert_lm_input_data_create(
+                        input.ffi_type(),
+                        bytes.as_ptr().cast(),
+                        bytes.len(),
+                        &mut raw,
+                    )
+                },
+            )?;
             let raw =
                 NonNull::new(raw).ok_or(Error::NullPointer("litert_lm_input_data_create"))?;
             ptrs.push(raw.as_ptr() as *const _);

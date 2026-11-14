@@ -21,7 +21,7 @@ pub struct StreamChunk {
 pub enum StreamEvent {
     Chunk(StreamChunk),
     /// Native stream failed to start (status != 0).
-    StartFailed(i32),
+    StartFailed(u32),
 }
 
 struct CallbackState {
@@ -37,22 +37,32 @@ extern "C" fn stream_callback(
     }
     let state = unsafe { &*(userdata as *const CallbackState) };
     let text = unsafe {
-        let ptr = ffi::litert_lm_stream_chunk_get_text(chunk);
-        if ptr.is_null() {
+        let mut ptr: *const std::os::raw::c_char = std::ptr::null();
+        if ffi::litert_lm_stream_chunk_get_text(chunk, &mut ptr)
+            != ffi::LiteRtLmStatusCode_kLiteRtLmStatusOk
+            || ptr.is_null()
+        {
             None
         } else {
             CStr::from_ptr(ptr).to_str().ok().map(str::to_owned)
         }
     };
     let error = unsafe {
-        let ptr = ffi::litert_lm_stream_chunk_get_error(chunk);
-        if ptr.is_null() {
+        let mut ptr: *const std::os::raw::c_char = std::ptr::null();
+        if ffi::litert_lm_stream_chunk_get_error(chunk, &mut ptr)
+            != ffi::LiteRtLmStatusCode_kLiteRtLmStatusOk
+            || ptr.is_null()
+        {
             None
         } else {
             CStr::from_ptr(ptr).to_str().ok().map(str::to_owned)
         }
     };
-    let is_final = unsafe { ffi::litert_lm_stream_chunk_is_final(chunk) };
+    let is_final = unsafe {
+        let mut out = false;
+        ffi::litert_lm_stream_chunk_is_final(chunk, &mut out);
+        out
+    };
     let _ = state.tx.send(StreamEvent::Chunk(StreamChunk {
         text,
         error,
@@ -103,8 +113,12 @@ impl StreamEventReceiver {
         let mut out = String::new();
         for event in self.rx.iter() {
             match event {
-                StreamEvent::StartFailed(code) => {
-                    return Err(Error::NativeStatus("stream_start", code));
+                StreamEvent::StartFailed(status) => {
+                    return Err(Error::NativeStatus {
+                        op: "stream_start",
+                        status,
+                        message: crate::error::last_error_message(),
+                    });
                 }
                 StreamEvent::Chunk(chunk) => {
                     if let Some(err) = chunk.error {
@@ -162,7 +176,7 @@ pub(crate) fn start_session_stream(
         )
     };
 
-    if status != 0 {
+    if status != ffi::LiteRtLmStatusCode_kLiteRtLmStatusOk {
         unsafe {
             drop(Box::from_raw(state_ptr));
         }
@@ -193,14 +207,15 @@ pub(crate) fn start_decode_stream(
             state_ptr.cast(),
         )
     };
-    if status != 0 {
+    if status != ffi::LiteRtLmStatusCode_kLiteRtLmStatusOk {
         unsafe {
             drop(Box::from_raw(state_ptr));
         }
-        return Err(Error::NativeStatus(
-            "litert_lm_session_run_decode_async",
+        return Err(Error::NativeStatus {
+            op: "litert_lm_session_run_decode_async",
             status,
-        ));
+            message: crate::error::last_error_message(),
+        });
     }
     Ok(new_receiver(rx, None, state_ptr))
 }
@@ -239,14 +254,15 @@ pub(crate) fn start_conversation_stream(
             state_ptr.cast(),
         )
     };
-    if status != 0 {
+    if status != ffi::LiteRtLmStatusCode_kLiteRtLmStatusOk {
         unsafe {
             drop(Box::from_raw(state_ptr));
         }
-        return Err(Error::NativeStatus(
-            "litert_lm_conversation_send_message_stream",
+        return Err(Error::NativeStatus {
+            op: "litert_lm_conversation_send_message_stream",
             status,
-        ));
+            message: crate::error::last_error_message(),
+        });
     }
     Ok(new_receiver(rx, None, state_ptr))
 }

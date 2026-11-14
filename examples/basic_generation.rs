@@ -32,7 +32,7 @@ fn main() -> litert_lm_rust::Result<()> {
         .unwrap_or_else(|| "What is the capital of France?".to_string());
 
     // Silence verbose native logs; show warnings and above.
-    litert_lm_rust::set_min_log_level(LogSeverity::Warning);
+    litert_lm_rust::set_min_log_level(LogSeverity::Warning)?;
 
     println!("Model  : {model_path}");
     println!("Prompt : {prompt}");

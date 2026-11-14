@@ -16,7 +16,6 @@
 //! from GitHub releases if not found locally.
 
 use std::env;
-use std::fs;
 use std::path::PathBuf;
 
 fn main() {

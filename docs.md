@@ -37,7 +37,7 @@ LiteRT-LM Rust bindings provide a safe, ergonomic interface to the LiteRT-LM C A
 
 ```toml
 [dependencies]
-litert-lm-rust = "0.2.2"
+litert-lm-rust = "0.3.0"
 ```
 
 The crate will automatically download the required native libraries from GitHub releases on first build (Windows only).
@@ -48,7 +48,7 @@ If you prefer to provide your own native libraries:
 
 ```toml
 [dependencies]
-litert-lm-rust = { version = "0.2.2", default-features = false }
+litert-lm-rust = { version = "0.3.0", default-features = false }
 ```
 
 Then set the `LITERT_LM_LIB_DIR` environment variable to point to your library directory.
@@ -204,8 +204,8 @@ High-level chat interface.
 - `send_message_stream(message: impl Into<Message>) -> Result<StreamEventReceiver>` - Send with streaming
 - `send_message_stream_with(message: impl Into<Message>, options: SendOptions) -> Result<StreamEventReceiver>` - Send with options and streaming
 - `clone_conversation() -> Result<Conversation>` - Clone the conversation
-- `cancel_process() -> ()` - Cancel ongoing generation
-- `token_count() -> Result<i32>` - Get current token count
+- `cancel_process() -> Result<()>` - Cancel ongoing generation
+- `token_count() -> Result<usize>` - Get current token count
 - `render_message(message: &Message) -> Result<String>` - Render message to string
 - `render_preface() -> Result<String>` - Render preface to string
 - `benchmark_info() -> Result<BenchmarkInfo>` - Get benchmark information
@@ -223,7 +223,12 @@ Low-level session API.
 - `run_prefill(inputs: &[InputData]) -> Result<()>` - Run prefill
 - `run_decode() -> Result<Responses>` - Run decode
 - `run_decode_async() -> Result<StreamEventReceiver>` - Run decode async
-- `cancel_process() -> ()` - Cancel ongoing process
+- `run_text_scoring(targets: &[&str], store_token_lengths: bool) -> Result<Responses>` - Score candidate texts
+- `clone_session() -> Result<Session>` - Clone session state
+- `save_checkpoint(label: &str) -> Result<()>` - Save a labeled checkpoint
+- `rewind_to_checkpoint(label: &str) -> Result<()>` - Rewind to a checkpoint
+- `rewind_to_step(step: i32) -> Result<()>` - Rewind to a step
+- `cancel_process() -> Result<()>` - Cancel ongoing process
 - `benchmark_info() -> Result<BenchmarkInfo>` - Get benchmark information
 
 ### Message
@@ -384,7 +389,7 @@ All operations return `Result<T, Error>` where `Error` is an enum:
 ```rust
 pub enum Error {
     NullPointer(&'static str),
-    NativeStatus(&'static str, i32),
+    NativeStatus { op: &'static str, status: u32, message: String },
     ModelPath,
     Nul(std::ffi::NulError),
     Utf8(std::str::Utf8Error),
@@ -398,7 +403,7 @@ pub enum Error {
 ### Common Errors
 
 - `NullPointer`: Native function returned null pointer
-- `NativeStatus`: Native function returned error code
+- `NativeStatus`: Native call failed; carries the status code and the thread-local native error message
 - `ModelPath`: Invalid model path
 - `Utf8`: Invalid UTF-8 from native library
 - `Json`: JSON serialization/deserialization error

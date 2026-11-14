@@ -12,7 +12,7 @@ use litert_lm_rust::{Backend, Engine, LogSeverity, Message};
 #[ignore = "requires native DLLs and model file"]
 fn test_basic_generation() {
     // Set log level to reduce noise
-    litert_lm_rust::set_min_log_level(LogSeverity::Warning);
+    litert_lm_rust::set_min_log_level(LogSeverity::Warning).expect("set log level");
 
     // Use the model file from the repository root
     let model_path = "gemma-4-E2B-it.litertlm";

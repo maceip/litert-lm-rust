@@ -4,7 +4,7 @@ use std::ffi::{CStr, CString};
 use std::ptr::NonNull;
 
 use crate::engine::{Engine, EngineLifetime};
-use crate::error::{Error, Result};
+use crate::error::{check, Error, Result};
 use crate::ffi;
 use crate::input::{InputData, OwnedInputs};
 use crate::sampler::SamplerParams;
@@ -31,14 +31,62 @@ unsafe impl Send for Session<'_> {}
 impl<'engine> Session<'engine> {
     pub(crate) fn new(engine: &'engine Engine, config: SessionConfig) -> Result<Self> {
         let raw_config = RawSessionConfig::new(config)?;
-        let raw = unsafe {
-            ffi::litert_lm_engine_create_session(engine.raw().as_ptr(), raw_config.as_mut_ptr())
-        };
+        let mut raw = std::ptr::null_mut();
+        check(
+            "litert_lm_engine_create_session",
+            unsafe {
+                ffi::litert_lm_engine_create_session(
+                    engine.raw().as_ptr(),
+                    raw_config.as_mut_ptr(),
+                    &mut raw,
+                )
+            },
+        )?;
         let raw = NonNull::new(raw).ok_or(Error::NullPointer("litert_lm_engine_create_session"))?;
         Ok(Self {
             raw,
             _engine: EngineLifetime::default(),
         })
+    }
+
+    /// Clone this session (copied KV cache / state).
+    pub fn clone_session(&self) -> Result<Session<'engine>> {
+        let mut raw = std::ptr::null_mut();
+        check(
+            "litert_lm_session_clone",
+            unsafe { ffi::litert_lm_session_clone(self.raw.as_ptr(), &mut raw) },
+        )?;
+        let raw = NonNull::new(raw).ok_or(Error::NullPointer("litert_lm_session_clone"))?;
+        Ok(Session {
+            raw,
+            _engine: EngineLifetime::default(),
+        })
+    }
+
+    /// Save a labeled checkpoint of the session state.
+    pub fn save_checkpoint(&mut self, label: &str) -> Result<()> {
+        let c = CString::new(label)?;
+        check(
+            "litert_lm_session_save_checkpoint",
+            unsafe { ffi::litert_lm_session_save_checkpoint(self.raw.as_ptr(), c.as_ptr()) },
+        )
+    }
+
+    /// Rewind the session to a previously saved checkpoint.
+    pub fn rewind_to_checkpoint(&mut self, label: &str) -> Result<()> {
+        let c = CString::new(label)?;
+        check(
+            "litert_lm_session_rewind_to_checkpoint",
+            unsafe { ffi::litert_lm_session_rewind_to_checkpoint(self.raw.as_ptr(), c.as_ptr()) },
+        )
+    }
+
+    /// Rewind the session to a given step index.
+    pub fn rewind_to_step(&mut self, step: i32) -> Result<()> {
+        check(
+            "litert_lm_session_rewind_to_step",
+            unsafe { ffi::litert_lm_session_rewind_to_step(self.raw.as_ptr(), step) },
+        )
     }
 
     pub fn generate_text(&mut self, prompt: &str) -> Result<String> {
@@ -52,13 +100,18 @@ impl<'engine> Session<'engine> {
 
     pub fn generate_content_responses(&mut self, inputs: &[InputData]) -> Result<Responses> {
         let owned = OwnedInputs::new(inputs)?;
-        let raw = unsafe {
-            ffi::litert_lm_session_generate_content(
-                self.raw.as_ptr(),
-                owned.as_ptr(),
-                owned.len(),
-            )
-        };
+        let mut raw = std::ptr::null_mut();
+        check(
+            "litert_lm_session_generate_content",
+            unsafe {
+                ffi::litert_lm_session_generate_content(
+                    self.raw.as_ptr(),
+                    owned.as_ptr(),
+                    owned.len(),
+                    &mut raw,
+                )
+            },
+        )?;
         let raw =
             NonNull::new(raw).ok_or(Error::NullPointer("litert_lm_session_generate_content"))?;
         Ok(Responses { raw })
@@ -75,18 +128,54 @@ impl<'engine> Session<'engine> {
 
     pub fn run_prefill(&mut self, inputs: &[InputData]) -> Result<()> {
         let owned = OwnedInputs::new(inputs)?;
-        let status = unsafe {
-            ffi::litert_lm_session_run_prefill(self.raw.as_ptr(), owned.as_ptr(), owned.len())
-        };
-        if status != 0 {
-            return Err(Error::NativeStatus("litert_lm_session_run_prefill", status));
-        }
-        Ok(())
+        check(
+            "litert_lm_session_run_prefill",
+            unsafe {
+                ffi::litert_lm_session_run_prefill(self.raw.as_ptr(), owned.as_ptr(), owned.len())
+            },
+        )
     }
 
     pub fn run_decode(&mut self) -> Result<Responses> {
-        let raw = unsafe { ffi::litert_lm_session_run_decode(self.raw.as_ptr()) };
+        let mut raw = std::ptr::null_mut();
+        check(
+            "litert_lm_session_run_decode",
+            unsafe { ffi::litert_lm_session_run_decode(self.raw.as_ptr(), &mut raw) },
+        )?;
         let raw = NonNull::new(raw).ok_or(Error::NullPointer("litert_lm_session_run_decode"))?;
+        Ok(Responses { raw })
+    }
+
+    /// Score candidate target texts against the current session state.
+    ///
+    /// When `store_token_lengths` is true, [`Responses::token_length_at`] is
+    /// populated for each candidate.
+    pub fn run_text_scoring(
+        &mut self,
+        targets: &[&str],
+        store_token_lengths: bool,
+    ) -> Result<Responses> {
+        let c_strings: Vec<CString> = targets
+            .iter()
+            .map(|t| CString::new(*t))
+            .collect::<std::result::Result<_, _>>()?;
+        let ptrs: Vec<*const std::os::raw::c_char> =
+            c_strings.iter().map(|c| c.as_ptr()).collect();
+        let mut raw = std::ptr::null_mut();
+        check(
+            "litert_lm_session_run_text_scoring",
+            unsafe {
+                ffi::litert_lm_session_run_text_scoring(
+                    self.raw.as_ptr(),
+                    ptrs.as_ptr() as *mut *const std::os::raw::c_char,
+                    ptrs.len(),
+                    store_token_lengths,
+                    &mut raw,
+                )
+            },
+        )?;
+        let raw =
+            NonNull::new(raw).ok_or(Error::NullPointer("litert_lm_session_run_text_scoring"))?;
         Ok(Responses { raw })
     }
 
@@ -94,12 +183,21 @@ impl<'engine> Session<'engine> {
         stream::start_decode_stream(self.raw)
     }
 
-    pub fn cancel_process(&mut self) {
-        unsafe { ffi::litert_lm_session_cancel_process(self.raw.as_ptr()) };
+    pub fn cancel_process(&mut self) -> Result<()> {
+        check(
+            "litert_lm_session_cancel_process",
+            unsafe { ffi::litert_lm_session_cancel_process(self.raw.as_ptr()) },
+        )
     }
 
     pub fn benchmark_info(&self) -> Result<crate::BenchmarkInfo> {
-        let raw = unsafe { ffi::litert_lm_session_get_benchmark_info(self.raw.as_ptr()) };
+        let mut raw = std::ptr::null_mut();
+        check(
+            "litert_lm_session_get_benchmark_info",
+            unsafe {
+                ffi::litert_lm_session_get_benchmark_info(self.raw.as_ptr(), &mut raw)
+            },
+        )?;
         let raw =
             NonNull::new(raw).ok_or(Error::NullPointer("litert_lm_session_get_benchmark_info"))?;
         Ok(crate::BenchmarkInfo { raw })
@@ -122,16 +220,29 @@ pub struct Responses {
 }
 
 impl Responses {
-    pub fn num_candidates(&self) -> i32 {
-        unsafe { ffi::litert_lm_responses_get_num_candidates(self.raw.as_ptr()) }
+    pub fn num_candidates(&self) -> Result<usize> {
+        let mut out = 0;
+        check(
+            "litert_lm_responses_get_num_candidates",
+            unsafe {
+                ffi::litert_lm_responses_get_num_candidates(self.raw.as_ptr(), &mut out)
+            },
+        )?;
+        Ok(out)
     }
 
-    pub fn text_at(&self, index: i32) -> Result<String> {
-        let count = self.num_candidates();
-        if index < 0 || index >= count {
-            return Err(Error::IndexOutOfRange(index as usize, count as usize));
+    pub fn text_at(&self, index: usize) -> Result<String> {
+        let count = self.num_candidates()?;
+        if index >= count {
+            return Err(Error::IndexOutOfRange(index, count));
         }
-        let ptr = unsafe { ffi::litert_lm_responses_get_response_text_at(self.raw.as_ptr(), index) };
+        let mut ptr: *const std::os::raw::c_char = std::ptr::null();
+        check(
+            "litert_lm_responses_get_response_text_at",
+            unsafe {
+                ffi::litert_lm_responses_get_response_text_at(self.raw.as_ptr(), index, &mut ptr)
+            },
+        )?;
         if ptr.is_null() {
             return Err(Error::NullPointer(
                 "litert_lm_responses_get_response_text_at",
@@ -141,41 +252,83 @@ impl Responses {
         Ok(text)
     }
 
-    pub fn score_at(&self, index: i32) -> Option<f32> {
-        unsafe {
-            if ffi::litert_lm_responses_has_score_at(self.raw.as_ptr(), index) {
-                Some(ffi::litert_lm_responses_get_score_at(self.raw.as_ptr(), index))
-            } else {
-                None
-            }
+    pub fn score_at(&self, index: usize) -> Result<Option<f32>> {
+        let mut has = false;
+        check(
+            "litert_lm_responses_has_score_at",
+            unsafe {
+                ffi::litert_lm_responses_has_score_at(self.raw.as_ptr(), index, &mut has)
+            },
+        )?;
+        if !has {
+            return Ok(None);
         }
+        let mut out = 0.0;
+        check(
+            "litert_lm_responses_get_score_at",
+            unsafe { ffi::litert_lm_responses_get_score_at(self.raw.as_ptr(), index, &mut out) },
+        )?;
+        Ok(Some(out))
     }
 
-    pub fn token_length_at(&self, index: i32) -> Option<i32> {
-        unsafe {
-            if ffi::litert_lm_responses_has_token_length_at(self.raw.as_ptr(), index) {
-                Some(ffi::litert_lm_responses_get_token_length_at(
+    pub fn token_length_at(&self, index: usize) -> Result<Option<usize>> {
+        let mut has = false;
+        check(
+            "litert_lm_responses_has_token_length_at",
+            unsafe {
+                ffi::litert_lm_responses_has_token_length_at(self.raw.as_ptr(), index, &mut has)
+            },
+        )?;
+        if !has {
+            return Ok(None);
+        }
+        let mut out = 0;
+        check(
+            "litert_lm_responses_get_token_length_at",
+            unsafe {
+                ffi::litert_lm_responses_get_token_length_at(self.raw.as_ptr(), index, &mut out)
+            },
+        )?;
+        Ok(Some(out))
+    }
+
+    pub fn token_scores_at(&self, index: usize) -> Result<Option<Vec<f32>>> {
+        let mut has = false;
+        check(
+            "litert_lm_responses_has_token_scores_at",
+            unsafe {
+                ffi::litert_lm_responses_has_token_scores_at(self.raw.as_ptr(), index, &mut has)
+            },
+        )?;
+        if !has {
+            return Ok(None);
+        }
+        let mut n = 0;
+        check(
+            "litert_lm_responses_get_num_token_scores_at",
+            unsafe {
+                ffi::litert_lm_responses_get_num_token_scores_at(
                     self.raw.as_ptr(),
                     index,
-                ))
-            } else {
-                None
-            }
+                    &mut n,
+                )
+            },
+        )?;
+        let mut ptr: *const f32 = std::ptr::null();
+        check(
+            "litert_lm_responses_get_token_scores_at",
+            unsafe {
+                ffi::litert_lm_responses_get_token_scores_at(
+                    self.raw.as_ptr(),
+                    index,
+                    &mut ptr,
+                )
+            },
+        )?;
+        if ptr.is_null() || n == 0 {
+            return Ok(None);
         }
-    }
-
-    pub fn token_scores_at(&self, index: i32) -> Option<Vec<f32>> {
-        unsafe {
-            if !ffi::litert_lm_responses_has_token_scores_at(self.raw.as_ptr(), index) {
-                return None;
-            }
-            let n = ffi::litert_lm_responses_get_num_token_scores_at(self.raw.as_ptr(), index);
-            let ptr = ffi::litert_lm_responses_get_token_scores_at(self.raw.as_ptr(), index);
-            if ptr.is_null() || n <= 0 {
-                return None;
-            }
-            Some(std::slice::from_raw_parts(ptr, n as usize).to_vec())
-        }
+        Ok(Some(unsafe { std::slice::from_raw_parts(ptr, n) }.to_vec()))
     }
 }
 
@@ -200,44 +353,52 @@ impl RawSessionConfig {
             return Ok(Self { raw: None });
         }
 
-        let raw = unsafe { ffi::litert_lm_session_config_create() };
+        let mut raw = std::ptr::null_mut();
+        check(
+            "litert_lm_session_config_create",
+            unsafe { ffi::litert_lm_session_config_create(&mut raw) },
+        )?;
         let raw =
             NonNull::new(raw).ok_or(Error::NullPointer("litert_lm_session_config_create"))?;
         let wrapper = Self { raw: Some(raw) };
 
         unsafe {
             if let Some(v) = config.max_output_tokens {
-                ffi::litert_lm_session_config_set_max_output_tokens(raw.as_ptr(), v);
+                check(
+                    "litert_lm_session_config_set_max_output_tokens",
+                    ffi::litert_lm_session_config_set_max_output_tokens(raw.as_ptr(), v),
+                )?;
             }
             if let Some(v) = config.apply_prompt_template {
-                ffi::litert_lm_session_config_set_apply_prompt_template(raw.as_ptr(), v);
+                check(
+                    "litert_lm_session_config_set_apply_prompt_template",
+                    ffi::litert_lm_session_config_set_apply_prompt_template(raw.as_ptr(), v),
+                )?;
             }
             if let Some(sampler) = config.sampler {
                 let params = sampler.create_ffi()?;
-                ffi::litert_lm_session_config_set_sampler_params(raw.as_ptr(), params.as_ptr());
+                check(
+                    "litert_lm_session_config_set_sampler_params",
+                    ffi::litert_lm_session_config_set_sampler_params(
+                        raw.as_ptr(),
+                        params.as_ptr(),
+                    ),
+                )?;
                 // params dropped after call; C API copies values.
             }
             if let Some(ref path) = config.lora_path {
                 let c = CString::new(path.as_str())?;
-                let status =
-                    ffi::litert_lm_session_config_set_lora_path(raw.as_ptr(), c.as_ptr());
-                if status != 0 {
-                    return Err(Error::NativeStatus(
-                        "litert_lm_session_config_set_lora_path",
-                        status,
-                    ));
-                }
+                check(
+                    "litert_lm_session_config_set_lora_path",
+                    ffi::litert_lm_session_config_set_lora_path(raw.as_ptr(), c.as_ptr()),
+                )?;
             }
             if let Some(ref path) = config.audio_lora_path {
                 let c = CString::new(path.as_str())?;
-                let status =
-                    ffi::litert_lm_session_config_set_audio_lora_path(raw.as_ptr(), c.as_ptr());
-                if status != 0 {
-                    return Err(Error::NativeStatus(
-                        "litert_lm_session_config_set_audio_lora_path",
-                        status,
-                    ));
-                }
+                check(
+                    "litert_lm_session_config_set_audio_lora_path",
+                    ffi::litert_lm_session_config_set_audio_lora_path(raw.as_ptr(), c.as_ptr()),
+                )?;
             }
         }
 

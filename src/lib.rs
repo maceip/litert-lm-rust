@@ -1,7 +1,8 @@
 //! Safe, idiomatic Rust bindings for [LiteRT-LM](https://github.com/google-ai-edge/LiteRT-LM).
 //!
-//! This crate wraps the stable LiteRT-LM **C API** (`c/engine.h`), which is the supported
-//! FFI surface for the C++ Conversation / Engine runtime documented in `litert.md`.
+//! This crate wraps the stable LiteRT-LM **C API** (`c/engine.h` + `c/conversation.h`,
+//! upstream C API v1.1.0), which is the supported FFI surface for the C++
+//! Conversation / Engine runtime documented in `litert.md`.
 //!
 //! # Features
 //! - **Conversation API** — chat-style `send_message` / streaming
@@ -79,7 +80,10 @@ pub use conversation::{
     NoRepeatNgramConfig, RepetitionPenaltyConfig, SendOptions, SuppressTokensConfig,
     ThinkingConfig,
 };
-pub use engine::{ActivationDataType, Backend, Engine, EngineBuilder, LogSeverity};
+pub use engine::{
+    ActivationDataType, Backend, Engine, EngineBuilder, LogSeverity, SpeculativeDecodingConfig,
+    SpeculativeDecodingMode,
+};
 pub use error::{Error, Result};
 pub use input::InputData;
 pub use message::{ContentPart, Message, Role};
@@ -91,6 +95,22 @@ pub use stream::{StreamChunk, StreamEvent, StreamEventReceiver};
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Set the minimum log severity for the native LiteRT-LM library.
-pub fn set_min_log_level(level: LogSeverity) {
-    unsafe { ffi::litert_lm_set_min_log_level(level.into_ffi()) }
+pub fn set_min_log_level(level: LogSeverity) -> Result<()> {
+    error::check(
+        "litert_lm_set_min_log_level",
+        unsafe { ffi::litert_lm_set_min_log_level(level.into_ffi()) },
+    )
+}
+
+/// Version of the C API the native library was built with
+/// (`litert_lm_get_api_version`).
+pub fn api_version() -> Result<(i32, i32, i32)> {
+    let mut major = 0;
+    let mut minor = 0;
+    let mut patch = 0;
+    error::check(
+        "litert_lm_get_api_version",
+        unsafe { ffi::litert_lm_get_api_version(&mut major, &mut minor, &mut patch) },
+    )?;
+    Ok((major, minor, patch))
 }

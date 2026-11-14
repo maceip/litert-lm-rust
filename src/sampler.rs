@@ -75,21 +75,36 @@ impl SamplerParams {
     }
 
     pub(crate) fn create_ffi(self) -> Result<RawSamplerParams> {
-        let raw = unsafe { ffi::litert_lm_sampler_params_create(self.sampler_type.into_ffi()) };
-        let raw =
-            NonNull::new(raw).ok_or(Error::NullPointer("litert_lm_sampler_params_create"))?;
+        let mut raw = std::ptr::null_mut();
+        crate::error::check(
+            "litert_lm_sampler_params_create",
+            unsafe { ffi::litert_lm_sampler_params_create(self.sampler_type.into_ffi(), &mut raw) },
+        )?;
+        let raw = NonNull::new(raw).ok_or(Error::NullPointer("litert_lm_sampler_params_create"))?;
         unsafe {
             if let Some(v) = self.top_k {
-                ffi::litert_lm_sampler_params_set_top_k(raw.as_ptr(), v);
+                crate::error::check(
+                    "litert_lm_sampler_params_set_top_k",
+                    ffi::litert_lm_sampler_params_set_top_k(raw.as_ptr(), v),
+                )?;
             }
             if let Some(v) = self.top_p {
-                ffi::litert_lm_sampler_params_set_top_p(raw.as_ptr(), v);
+                crate::error::check(
+                    "litert_lm_sampler_params_set_top_p",
+                    ffi::litert_lm_sampler_params_set_top_p(raw.as_ptr(), v),
+                )?;
             }
             if let Some(v) = self.temperature {
-                ffi::litert_lm_sampler_params_set_temperature(raw.as_ptr(), v);
+                crate::error::check(
+                    "litert_lm_sampler_params_set_temperature",
+                    ffi::litert_lm_sampler_params_set_temperature(raw.as_ptr(), v),
+                )?;
             }
             if let Some(v) = self.seed {
-                ffi::litert_lm_sampler_params_set_seed(raw.as_ptr(), v);
+                crate::error::check(
+                    "litert_lm_sampler_params_set_seed",
+                    ffi::litert_lm_sampler_params_set_seed(raw.as_ptr(), v),
+                )?;
             }
         }
         Ok(RawSamplerParams { raw })
