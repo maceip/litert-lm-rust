@@ -73,7 +73,7 @@ let engine = Engine::builder("model.litertlm")
 The crate includes a `download-native` feature (enabled by default) that automatically downloads the required native libraries from GitHub releases on first build. The native libraries are built from the LiteRT-LM source using a GitHub Actions workflow and published as release assets.
 
 **Downloaded files:**
-- `litert-lm.dll` - Main LiteRT-LM library
+- `litert-lm.dll` - Main LiteRT-LM library.
 - `litert-lm.if.lib` - Import library for linking
 - `libLiteRt.dll` - LiteRT runtime library
 - `libGemmaModelConstraintProvider.dll` - Gemma constraint provider
