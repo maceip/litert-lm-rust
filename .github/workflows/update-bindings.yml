@@ -41,6 +41,7 @@ jobs:
           if [ -z "$last" ]; then
             echo "No previous auto-sync commit; proceeding."
             echo "- Rate limit: no previous auto-sync commit; proceeding." >> "$GITHUB_STEP_SUMMARY"
+            echo "::notice title=Rate limit (max 1 auto-update / 3 days)::no previous auto-sync commit; proceeding"
             echo "skip=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -51,9 +52,11 @@ jobs:
           if [ "$age_days" -lt 3 ]; then
             echo "Rate limit hit: at most one automatic update per 3 days. Skipping."
             echo "- Rate limit: last auto-sync $age_days day(s) ago; skipping (max 1 per 3 days)." >> "$GITHUB_STEP_SUMMARY"
+            echo "::notice title=Rate limit (max 1 auto-update / 3 days)::last auto-sync ${age_days} day(s) ago; skipping"
             echo "skip=true" >> "$GITHUB_OUTPUT"
           else
             echo "- Rate limit: last auto-sync $age_days day(s) ago; proceeding." >> "$GITHUB_STEP_SUMMARY"
+            echo "::notice title=Rate limit (max 1 auto-update / 3 days)::last auto-sync ${age_days} day(s) ago; proceeding"
             echo "skip=false" >> "$GITHUB_OUTPUT"
           fi
 
@@ -97,6 +100,7 @@ jobs:
             echo "c/${f}: $(wc -c < c/${f}) bytes, sha256=${h}"
             echo "| c/${f} | $(wc -c < c/${f}) | \`${h}\` |" >> "$GITHUB_STEP_SUMMARY"
           done
+          echo "::notice title=Sync C API headers from upstream::google-ai-edge/LiteRT-LM @ ${UPSTREAM_SHA} — c/engine.h $(wc -c < c/engine.h) bytes sha256 $(sha256sum c/engine.h | cut -c1-16)…, c/conversation.h $(wc -c < c/conversation.h) bytes sha256 $(sha256sum c/conversation.h | cut -c1-16)…"
           echo "UPSTREAM_SHA=${UPSTREAM_SHA}" >> "$GITHUB_ENV"
 
       - name: Regenerate FFI bindings (bindgen)
@@ -108,6 +112,7 @@ jobs:
           cargo build --no-default-features --features bindgen,docs-only
           lines=$(wc -l < src/bindings.rs)
           echo "src/bindings.rs regenerated: ${lines} lines"
+          echo "::notice title=Regenerate FFI bindings (bindgen)::src/bindings.rs regenerated: ${lines} lines"
           {
             echo "### Regenerate FFI bindings (bindgen)"
             echo "- src/bindings.rs regenerated via bindgen: **${lines} lines**"
@@ -118,6 +123,7 @@ jobs:
         run: |
           set -eux
           cargo check --all-targets --no-default-features --features docs-only
+          echo "::notice title=Verify (cargo check all targets)::cargo check --all-targets: OK"
           {
             echo "### Verify (cargo check all targets)"
             echo "- cargo check --all-targets: **OK**"
@@ -132,6 +138,7 @@ jobs:
           git add c/engine.h c/conversation.h c/api_export.h c/error_reporter.h src/bindings.rs
           if git diff --cached --quiet; then
             echo "No changes: bindings already up to date with upstream ${UPSTREAM_SHA}."
+            echo "::notice title=Commit and push if changed::no changes — bindings already up to date with upstream ${UPSTREAM_SHA}"
             {
               echo "### Commit and push if changed"
               echo "- Result: **no changes** — bindings already up to date with upstream \`${UPSTREAM_SHA}\`."
@@ -143,6 +150,7 @@ jobs:
           git push origin master
           NEW_SHA=$(git rev-parse --short HEAD)
           echo "Pushed auto-sync commit ${NEW_SHA} for upstream ${UPSTREAM_SHA}."
+          echo "::notice title=Commit and push if changed::pushed auto-sync commit ${NEW_SHA} to master for upstream ${UPSTREAM_SHA}"
           {
             echo "### Commit and push if changed"
             echo "- Result: **pushed** auto-sync commit \`${NEW_SHA}\` → master for upstream \`${UPSTREAM_SHA}\`."
