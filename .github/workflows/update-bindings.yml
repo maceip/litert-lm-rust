@@ -34,8 +34,13 @@ jobs:
         run: |
           set -eux
           last=$(git log -1 --format=%cI --grep='chore(bindings): auto-sync' || true)
+          {
+            echo "### Rate limit (max one auto-update per 3 days)"
+            echo "- Event: \`${GITHUB_EVENT_NAME}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
           if [ -z "$last" ]; then
             echo "No previous auto-sync commit; proceeding."
+            echo "- Rate limit: no previous auto-sync commit; proceeding." >> "$GITHUB_STEP_SUMMARY"
             echo "skip=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -45,8 +50,10 @@ jobs:
           echo "Last auto-sync: $last ($age_days day(s) ago)"
           if [ "$age_days" -lt 3 ]; then
             echo "Rate limit hit: at most one automatic update per 3 days. Skipping."
+            echo "- Rate limit: last auto-sync $age_days day(s) ago; skipping (max 1 per 3 days)." >> "$GITHUB_STEP_SUMMARY"
             echo "skip=true" >> "$GITHUB_OUTPUT"
           else
+            echo "- Rate limit: last auto-sync $age_days day(s) ago; proceeding." >> "$GITHUB_STEP_SUMMARY"
             echo "skip=false" >> "$GITHUB_OUTPUT"
           fi
 
@@ -78,8 +85,17 @@ jobs:
           echo "Upstream google-ai-edge/LiteRT-LM @ ${UPSTREAM_SHA}"
           cp upstream/c/engine.h upstream/c/conversation.h \
              upstream/c/api_export.h upstream/c/error_reporter.h c/
+          {
+            echo "### Sync C API headers from upstream"
+            echo "- Upstream google-ai-edge/LiteRT-LM @ \`${UPSTREAM_SHA}\`"
+            echo ""
+            echo "| header | bytes | sha256 |"
+            echo "| --- | --- | --- |"
+          } >> "$GITHUB_STEP_SUMMARY"
           for f in engine.h conversation.h api_export.h error_reporter.h; do
-            echo "c/${f}: $(wc -c < c/${f}) bytes, sha256=$(sha256sum c/${f} | cut -d' ' -f1)"
+            h=$(sha256sum c/${f} | cut -d' ' -f1)
+            echo "c/${f}: $(wc -c < c/${f}) bytes, sha256=${h}"
+            echo "| c/${f} | $(wc -c < c/${f}) | \`${h}\` |" >> "$GITHUB_STEP_SUMMARY"
           done
           echo "UPSTREAM_SHA=${UPSTREAM_SHA}" >> "$GITHUB_ENV"
 
@@ -90,13 +106,22 @@ jobs:
           export LIBCLANG_PATH="$(llvm-config --libdir)"
           echo "LIBCLANG_PATH=${LIBCLANG_PATH}"
           cargo build --no-default-features --features bindgen,docs-only
-          echo "src/bindings.rs regenerated: $(wc -l < src/bindings.rs) lines"
+          lines=$(wc -l < src/bindings.rs)
+          echo "src/bindings.rs regenerated: ${lines} lines"
+          {
+            echo "### Regenerate FFI bindings (bindgen)"
+            echo "- src/bindings.rs regenerated via bindgen: **${lines} lines**"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Verify (cargo check all targets)
         if: steps.rate.outputs.skip != 'true'
         run: |
           set -eux
           cargo check --all-targets --no-default-features --features docs-only
+          {
+            echo "### Verify (cargo check all targets)"
+            echo "- cargo check --all-targets: **OK**"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Commit and push if changed
         if: steps.rate.outputs.skip != 'true'
@@ -107,9 +132,18 @@ jobs:
           git add c/engine.h c/conversation.h c/api_export.h c/error_reporter.h src/bindings.rs
           if git diff --cached --quiet; then
             echo "No changes: bindings already up to date with upstream ${UPSTREAM_SHA}."
+            {
+              echo "### Commit and push if changed"
+              echo "- Result: **no changes** — bindings already up to date with upstream \`${UPSTREAM_SHA}\`."
+            } >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
           git commit -m "chore(bindings): auto-sync with upstream LiteRT-LM (${UPSTREAM_SHA})"
           git pull --rebase origin master
           git push origin master
-          echo "Pushed auto-sync commit for upstream ${UPSTREAM_SHA}."
+          NEW_SHA=$(git rev-parse --short HEAD)
+          echo "Pushed auto-sync commit ${NEW_SHA} for upstream ${UPSTREAM_SHA}."
+          {
+            echo "### Commit and push if changed"
+            echo "- Result: **pushed** auto-sync commit \`${NEW_SHA}\` → master for upstream \`${UPSTREAM_SHA}\`."
+          } >> "$GITHUB_STEP_SUMMARY"
