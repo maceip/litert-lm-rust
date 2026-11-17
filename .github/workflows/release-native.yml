@@ -292,7 +292,7 @@ jobs:
           mkdir -p /tmp/verify-native
           tar -xzf /tmp/pulled/litert-lm-out.tar.gz -C /tmp/verify-native
 
-          echo "=== Verify $ORIGIN RUNPATH on liblitert-lm.so ==="
+          echo '=== Verify $ORIGIN RUNPATH on liblitert-lm.so ==='
           readelf -d /tmp/verify-native/liblitert-lm.so | grep -E 'RPATH|RUNPATH' | grep -F '$ORIGIN'
 
           echo "=== Verify glibc symbol ceiling (<= 2.36) and 100% C API symbol coverage ==="
@@ -568,7 +568,7 @@ jobs:
           ARCHIVE="litert-lm-${TAG}-x86_64-unknown-linux-gnu.tar.gz"
 
           mkdir -p /tmp/release-dl
-          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir /tmp/release-dl
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir /tmp/release-dl --clobber
           (cd /tmp/release-dl && sha256sum -c SHA256SUMS.txt)
 
           for f in "/tmp/release-dl/${ARCHIVE}" \
