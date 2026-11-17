@@ -89,7 +89,7 @@ curl -fsSLO https://github.com/maceip/litert-lm-rust/releases/download/v0.3.0/li
 
 sha256sum -c litert-lm-v0.3.0-x86_64-unknown-linux-gnu.tar.gz.sha256
 gh attestation verify litert-lm-v0.3.0-x86_64-unknown-linux-gnu.tar.gz --repo maceip/litert-lm-rust
-gh attestation verify litert-lm-v0.3.0-x86_64-unknown-linux-gnu.tar.gz --repo maceip/litert-lm-rust --predicate-type https://spdx.dev/Document
+gh attestation verify litert-lm-v0.3.0-x86_64-unknown-linux-gnu.tar.gz --repo maceip/litert-lm-rust --predicate-type https://spdx.dev/Document/v2.3
 ```
 
 ### Using in another project

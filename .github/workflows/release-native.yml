@@ -275,7 +275,7 @@ jobs:
             '
 
           mkdir -p /tmp/pulled
-          env -C /tmp/lim-ws lim gradle pull-file litert-lm-out.tar.gz /tmp/pulled/litert-lm-out.tar.gz
+          env -C /tmp/lim-ws lim gradle pull-file litert-lm-out.tar.gz /tmp/pulled/litert-lm-out.tar.gz --id "$SANDBOX_ID"
 
           ASSET_NAME="litert-lm-linux-x86_64-${SHORT_REF}.tar.gz"
           cp /tmp/pulled/litert-lm-out.tar.gz "/tmp/pulled/$ASSET_NAME"
@@ -436,7 +436,7 @@ jobs:
             dataLicense: "CC0-1.0",
             SPDXID: "SPDXRef-DOCUMENT",
             name: `litert-lm-${tag}-${target}`,
-            documentNamespace: `${baseUrl}/${archive}.spdx.json#${archiveSha}`,
+            documentNamespace: `${baseUrl}/${archive}.spdx.json/${archiveSha}`,
             creationInfo: {
               created,
               creators: [`Tool: litert-lm-rust-release-${version}`, `Organization: ${repoSlug.split("/")[0]}`],
@@ -537,7 +537,7 @@ jobs:
 
           # 3. Verify cryptographic SLSA v1.0 build provenance & SPDX 2.3 SBOM
           gh attestation verify "${ARCHIVE}" --repo ${GITHUB_REPOSITORY}
-          gh attestation verify "${ARCHIVE}" --repo ${GITHUB_REPOSITORY} --predicate-type https://spdx.dev/Document
+          gh attestation verify "${ARCHIVE}" --repo ${GITHUB_REPOSITORY} --predicate-type https://spdx.dev/Document/v2.3
           \`\`\`
 
           ### SHA-256 Checksums
@@ -577,7 +577,7 @@ jobs:
                    /tmp/release-dl/libwebgpu_dawn.so; do
             gh attestation verify "$f" --repo "$GITHUB_REPOSITORY"
           done
-          gh attestation verify "/tmp/release-dl/${ARCHIVE}" --repo "$GITHUB_REPOSITORY" --predicate-type https://spdx.dev/Document
+          gh attestation verify "/tmp/release-dl/${ARCHIVE}" --repo "$GITHUB_REPOSITORY" --predicate-type https://spdx.dev/Document/v2.3
 
           echo "=== Verify fresh Cargo download-native build against public GitHub Release URL ==="
           env -u LITERT_LM_LIB_DIR -u LD_LIBRARY_PATH \
