@@ -18,10 +18,10 @@ This crate wraps the stable **C API** (`c/engine.h` + `c/conversation.h`), which
 
 ```toml
 [dependencies]
-litert-lm-rust = { git = "https://github.com/maceip/litert-lm-rust", tag = "v0.3.0" }
+litert-lm-rust = { git = "https://github.com/maceip/litert-lm-rust", tag = "v0.3.1" }
 ```
 
-On `x86_64-unknown-linux-gnu`, `build.rs` (`download-native` enabled by default) automatically downloads the portable LiteRT-LM shared libraries from [GitHub Releases](https://github.com/maceip/litert-lm-rust/releases) (`glibc >= 2.36`, static `libstdc++`, `$ORIGIN` `RUNPATH`) and verifies each file's SHA-256 checksum before linking.
+On **Linux `x86_64`** (`x86_64-unknown-linux-gnu`), **macOS `arm64`** (`aarch64-apple-darwin`), and **Windows `x86_64`** (`x86_64-pc-windows-msvc`), `build.rs` (`download-native` enabled by default) automatically downloads the SLSA-attested LiteRT-LM shared libraries from [GitHub Releases](https://github.com/maceip/litert-lm-rust/releases) and verifies each file's SHA-256 checksum before linking.
 
 ## Quick start
 
@@ -72,24 +72,23 @@ let engine = Engine::builder("model.litertlm")
 
 The `download-native` feature (enabled by default) downloads prebuilt native libraries from `https://github.com/maceip/litert-lm-rust/releases/download/v<version>` (overridable via `LITERT_LM_RELEASE_URL`) into `<OUT_DIR>/prebuilt/` when no local library is found, verifying every file against its `.sha256` sidecar before linking.
 
-Native Linux releases are built from pinned upstream `google-ai-edge/LiteRT-LM` (`c/UPSTREAM_COMMIT`) on a 96-vCPU Limrun sandbox via `.github/workflows/release-native.yml` and signed with GitHub Sigstore OIDC **SLSA v1.0 build provenance** and an attested **SPDX 2.3 SBOM**.
+Releases are built from pinned upstream `google-ai-edge/LiteRT-LM` (`c/UPSTREAM_COMMIT`) via `.github/workflows/release-native.yml` (backed by Limrun 96-vCPU sandboxes, Limrun RBE remote cache, and Limrun Asset Storage) and signed with GitHub Sigstore OIDC **SLSA v1.0 build provenance** and attested **SPDX 2.3 SBOMs**.
 
-**Linux (`x86_64-unknown-linux-gnu`) release assets:**
-- `litert-lm-v0.3.0-x86_64-unknown-linux-gnu.tar.gz` (+ `.sha256` and `.spdx.json`) — complete portable archive
-- `liblitert-lm.so` (+ `.sha256`) — main LiteRT-LM C API v1.1.0 shared library
-- `libGemmaModelConstraintProvider.so` (+ `.sha256`) — Gemma structured/constrained decoding provider
-- `libwebgpu_dawn.so` (+ `.sha256`) — Dawn WebGPU runtime
-- `SHA256SUMS.txt` — combined SHA-256 manifest
+**Published platform bundles (`v0.3.1`):**
+- **Linux (`x86_64-unknown-linux-gnu`)**: `litert-lm-v0.3.1-x86_64-unknown-linux-gnu.tar.gz` (`liblitert-lm.so`, `libGemmaModelConstraintProvider.so`, `libwebgpu_dawn.so`, `glibc >= 2.36`, `$ORIGIN` `RUNPATH`)
+- **macOS (`aarch64-apple-darwin`)**: `litert-lm-v0.3.1-aarch64-apple-darwin.tar.gz` (`liblitert-lm.dylib`, `libGemmaModelConstraintProvider.dylib`, `libwebgpu_dawn.dylib`, `@loader_path` `LC_RPATH`)
+- **Windows (`x86_64-pc-windows-msvc`)**: `litert-lm-v0.3.1-x86_64-pc-windows-msvc.tar.gz` (`litert-lm.dll`, `litert-lm.lib`, `litert-lm.if.lib`, `libGemmaModelConstraintProvider.dll`, `webgpu_dawn.dll`)
+- `SHA256SUMS.txt` + per-file `.sha256` sidecars + per-platform `.spdx.json` SBOMs
 
 **Verifying release authenticity manually:**
 
 ```bash
-curl -fsSLO https://github.com/maceip/litert-lm-rust/releases/download/v0.3.0/litert-lm-v0.3.0-x86_64-unknown-linux-gnu.tar.gz
-curl -fsSLO https://github.com/maceip/litert-lm-rust/releases/download/v0.3.0/litert-lm-v0.3.0-x86_64-unknown-linux-gnu.tar.gz.sha256
-
-sha256sum -c litert-lm-v0.3.0-x86_64-unknown-linux-gnu.tar.gz.sha256
-gh attestation verify litert-lm-v0.3.0-x86_64-unknown-linux-gnu.tar.gz --repo maceip/litert-lm-rust
-gh attestation verify litert-lm-v0.3.0-x86_64-unknown-linux-gnu.tar.gz --repo maceip/litert-lm-rust --predicate-type https://spdx.dev/Document/v2.3
+for target in x86_64-unknown-linux-gnu aarch64-apple-darwin x86_64-pc-windows-msvc; do
+  archive="litert-lm-v0.3.1-${target}.tar.gz"
+  gh release download v0.3.1 --repo maceip/litert-lm-rust -p "$archive" -p "SHA256SUMS.txt" --clobber
+  gh attestation verify "$archive" --repo maceip/litert-lm-rust
+  gh attestation verify "$archive" --repo maceip/litert-lm-rust --predicate-type https://spdx.dev/Document/v2.3
+done
 ```
 
 ### Using in another project
@@ -98,12 +97,11 @@ gh attestation verify litert-lm-v0.3.0-x86_64-unknown-linux-gnu.tar.gz --repo ma
 
 1. `LITERT_LM_LIB_DIR` environment variable
 2. `<OUT_DIR>/prebuilt/` (auto-downloaded location when `download-native` is enabled)
-3. `<crate_dir>/prebuilt/`
-4. `<crate_dir>/prebuilt/macos/`
-5. `<crate_dir>/native/`
-6. `<crate_dir>/c/` and `<crate_dir>/c/build/`
+3. `<crate_dir>/prebuilt/` (`prebuilt/{macos,windows,linux}/`)
+4. `<crate_dir>/native/` (`native/{macos,windows,linux}/`)
+5. `<crate_dir>/c/` and `<crate_dir>/c/build/`
 
-On Linux and macOS, `build.rs` embeds `-Wl,-rpath,<dir>` and `liblitert-lm.so` carries `RUNPATH=$ORIGIN`, so executables resolve companion libraries without setting `LD_LIBRARY_PATH`. On Windows, runtime DLLs must be on `PATH` or next to the executable.
+On Linux and macOS, `build.rs` embeds `-Wl,-rpath,<dir>`, so executables resolve companion libraries without setting `LD_LIBRARY_PATH` or `DYLD_LIBRARY_PATH`. On Windows, `build.rs` automatically stages companion `.dll` files into Cargo's active profile directory (`target/<profile>/`, `deps/`, and `examples/`).
 
 ### Building or Hydrating via Limrun (`scripts/limrun-build.sh`)
 

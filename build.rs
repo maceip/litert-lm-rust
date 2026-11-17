@@ -140,7 +140,12 @@ fn local_search_dirs(manifest_dir: &std::path::Path) -> Vec<PathBuf> {
         env::var_os("LITERT_LM_LIB_DIR").map(PathBuf::from),
         Some(manifest_dir.join("prebuilt")),
         Some(manifest_dir.join("prebuilt/macos")),
+        Some(manifest_dir.join("prebuilt/windows")),
+        Some(manifest_dir.join("prebuilt/linux")),
         Some(manifest_dir.join("native")),
+        Some(manifest_dir.join("native/macos")),
+        Some(manifest_dir.join("native/windows")),
+        Some(manifest_dir.join("native/linux")),
         Some(manifest_dir.join("c")),
         Some(manifest_dir.join("c/build")),
     ]
@@ -182,7 +187,7 @@ fn link_native_library(manifest_dir: &PathBuf, out_dir: &PathBuf) {
             if dir_has_library(dir, name) {
                 println!("cargo:rustc-link-search=native={}", dir.display());
                 emit_link_lib(name, dir);
-                emit_platform_extra_libs(dir);
+                emit_platform_extra_libs(dir, out_dir);
                 return;
             }
         }
@@ -203,10 +208,14 @@ fn emit_link_lib(name: &str, dir: &PathBuf) {
     let is_static = env::var_os("LITERT_LM_STATIC").is_some();
 
     if cfg!(windows) && !is_static {
+        let std_lib = dir.join(format!("{name}.lib"));
         let if_lib = dir.join(format!("{name}.if.lib"));
-        if if_lib.exists() {
+        if std_lib.exists() {
             println!("cargo:rustc-link-lib=dylib={name}");
-            println!("cargo:rustc-link-arg={}", if_lib.display());
+            return;
+        }
+        if if_lib.exists() {
+            println!("cargo:rustc-link-lib=dylib={name}.if");
             return;
         }
     }
@@ -218,7 +227,7 @@ fn emit_link_lib(name: &str, dir: &PathBuf) {
     }
 }
 
-fn emit_platform_extra_libs(dir: &std::path::Path) {
+fn emit_platform_extra_libs(dir: &std::path::Path, out_dir: &std::path::Path) {
     if cfg!(target_os = "linux") {
         println!("cargo:rustc-link-lib=dylib=stdc++");
         println!("cargo:rustc-link-lib=dylib=m");
@@ -233,21 +242,73 @@ fn emit_platform_extra_libs(dir: &std::path::Path) {
         println!("cargo:rustc-link-arg=-Wl,-rpath,@executable_path");
         println!("cargo:rustc-link-arg=-Wl,-rpath,@loader_path");
         println!("cargo:rustc-link-arg=-Wl,-rpath,@loader_path/../lib");
+    } else if cfg!(target_os = "windows") {
+        stage_windows_dlls(dir, out_dir);
     }
 }
 
-/// Return true if the directory contains any recognisable library file for `name`.
+fn stage_windows_dlls(dir: &std::path::Path, out_dir: &std::path::Path) {
+    let Some(profile_dir) = out_dir.ancestors().nth(3) else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let dlls: Vec<PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.is_file()
+                && p.extension()
+                    .and_then(|s| s.to_str())
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("dll"))
+        })
+        .collect();
+    if dlls.is_empty() {
+        return;
+    }
+    for sub in ["", "deps", "examples"] {
+        let dest_dir = if sub.is_empty() {
+            profile_dir.to_path_buf()
+        } else {
+            profile_dir.join(sub)
+        };
+        if std::fs::create_dir_all(&dest_dir).is_err() {
+            continue;
+        }
+        for src in &dlls {
+            let Some(file_name) = src.file_name() else {
+                continue;
+            };
+            let dst = dest_dir.join(file_name);
+            let same_size = std::fs::metadata(src)
+                .ok()
+                .zip(std::fs::metadata(&dst).ok())
+                .is_some_and(|(a, b)| a.len() == b.len());
+            if !same_size {
+                let _ = std::fs::copy(src, &dst);
+            }
+        }
+    }
+}
+
+/// Return true if the directory contains any linkable library file for `name`.
 fn dir_has_library(dir: &PathBuf, name: &str) -> bool {
     if !dir.is_dir() {
         return false;
     }
+    if cfg!(windows) {
+        let win_candidates = [
+            format!("{name}.lib"),
+            format!("{name}.if.lib"),
+            format!("lib{name}.a"),
+            format!("{name}.a"),
+        ];
+        return win_candidates.iter().any(|n| dir.join(n).exists());
+    }
     let candidates = [
-        format!("{name}.dll"),
-        format!("{name}.lib"),
-        format!("{name}.if.lib"),
         format!("lib{name}.so"),
         format!("lib{name}.dylib"),
-        format!("lib{name}.dll"),
         format!("lib{name}.a"),
         format!("{name}.a"),
     ];
@@ -259,7 +320,7 @@ fn dir_has_library(dir: &PathBuf, name: &str) -> bool {
 #[cfg(feature = "download-native")]
 const DEFAULT_RELEASE_REPO: &str = "https://github.com/maceip/litert-lm-rust";
 
-/// Required native files for the current platform.
+/// Required native files for the current platform (matching `google-ai-edge/LiteRT-LM` C API v1.1.0).
 #[cfg(feature = "download-native")]
 fn required_native_files() -> Result<Vec<&'static str>, String> {
     if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
@@ -268,23 +329,19 @@ fn required_native_files() -> Result<Vec<&'static str>, String> {
             "libGemmaModelConstraintProvider.so",
             "libwebgpu_dawn.so",
         ])
-    } else if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
-        Ok(vec![
-            "litert-lm.dll",
-            "litert-lm.if.lib",
-            "libLiteRt.dll",
-            "libGemmaModelConstraintProvider.dll",
-            "libLiteRtTopKWebGpuSampler.dll",
-            "libLiteRtWebGpuAccelerator.dll",
-            "libwebgpu_dawn.dll",
-        ])
     } else if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
         Ok(vec![
             "liblitert-lm.dylib",
-            "libLiteRt.dylib",
             "libGemmaModelConstraintProvider.dylib",
-            "libLiteRtTopKMetalSampler.dylib",
-            "libLiteRtMetalAccelerator.dylib",
+            "libwebgpu_dawn.dylib",
+        ])
+    } else if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
+        Ok(vec![
+            "litert-lm.dll",
+            "litert-lm.lib",
+            "litert-lm.if.lib",
+            "libGemmaModelConstraintProvider.dll",
+            "webgpu_dawn.dll",
         ])
     } else {
         Err(format!(
@@ -323,7 +380,12 @@ fn has_required_files(prebuilt_dir: &PathBuf) -> bool {
 #[cfg(feature = "download-native")]
 fn release_base_url() -> String {
     env::var("LITERT_LM_RELEASE_URL")
-        .unwrap_or_else(|_| format!("{DEFAULT_RELEASE_REPO}/releases/download/v{}", env!("CARGO_PKG_VERSION")))
+        .unwrap_or_else(|_| {
+            format!(
+                "{DEFAULT_RELEASE_REPO}/releases/download/v{}",
+                env!("CARGO_PKG_VERSION")
+            )
+        })
         .trim_end_matches('/')
         .to_string()
 }
@@ -364,6 +426,14 @@ fn download_native_libraries(prebuilt_dir: &PathBuf) -> Result<(), String> {
             .map_err(|e| format!("Failed to move {} into place: {e}", dest_path.display()))?;
         std::fs::write(&stamp_path, format!("{actual_sha} {size}\n"))
             .map_err(|e| format!("Failed to write {}: {e}", stamp_path.display()))?;
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let alias = prebuilt_dir.join("liblitert-lm.so");
+        if !alias.exists() {
+            let _ = std::os::unix::fs::symlink("liblitert-lm.dylib", &alias);
+        }
     }
 
     Ok(())

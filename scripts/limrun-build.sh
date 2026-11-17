@@ -4,15 +4,14 @@
 set -euo pipefail
 
 # Build or hydrate upstream `google-ai-edge/LiteRT-LM` (`//c:litert-lm`) using
-# Limrun 96-vCPU Linux sandboxes, Limrun Asset Storage, or the SLSA-attested
-# public GitHub Release fallback.
+# Limrun 96-vCPU sandboxes, Limrun Asset Storage, or the SLSA-attested
+# public GitHub Release fallback (Linux x86_64 and macOS arm64).
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="${LITERT_LM_RUST_DIR:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 UPSTREAM_REPO="https://github.com/google-ai-edge/LiteRT-LM.git"
 DEFAULT_UPSTREAM_REF="083c49c4a088ba7675186292f43c92d8f5464056"
 PINNED_REF="083c49c4a088ba7675186292f43c92d8f5464056"
-PINNED_SHA256="4c682512b50b02ceff1bba618f196ae67abe83623f9761ee68ad274eeb90e6ed"
 FORCE_REBUILD=0
 HYDRATE_ONLY=0
 KEEP_SANDBOX=0
@@ -49,8 +48,8 @@ while [[ $# -gt 0 ]]; do
       cat <<'EOF'
 Usage: scripts/limrun-build.sh [--repo <dir>] [--ref <sha>] [--force-rebuild] [--hydrate-only] [--if-authenticated] [--keep-sandbox]
 
-Hydrates `prebuilt/liblitert-lm.so` (and companion runtime libraries) from Limrun
-Asset Storage or the SHA-256-verified public GitHub Release, or builds
+Hydrates `prebuilt/` (`liblitert-lm.{so,dylib}` and companion runtime libraries)
+from Limrun Asset Storage or the SHA-256-verified public GitHub Release, or builds
 `google-ai-edge/LiteRT-LM` (`//c:litert-lm`) on a 96-vCPU Limrun sandbox and
 pushes the artifact to Limrun Asset Storage.
 EOF
@@ -64,6 +63,14 @@ EOF
 done
 
 export PATH="$HOME/.local/bin:$HOME/.cargo/bin:/usr/local/bin:$PATH"
+
+sha256_hex() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print tolower($1)}'
+  else
+    shasum -a 256 "$1" | awk '{print tolower($1)}'
+  fi
+}
 
 ensure_lim_auth() {
   if [[ -n "${LIM_API_KEY:-}" ]]; then
@@ -102,37 +109,45 @@ else
   UPSTREAM_REF="$DEFAULT_UPSTREAM_REF"
 fi
 
+HOST_OS="$(uname -s)"
+HOST_ARCH="$(uname -m)"
+case "${HOST_OS}/${HOST_ARCH}" in
+  Linux/x86_64)
+    PLATFORM_SLUG="linux-x86_64"
+    RUST_TARGET="x86_64-unknown-linux-gnu"
+    MAIN_LIB="liblitert-lm.so"
+    ;;
+  Darwin/arm64)
+    PLATFORM_SLUG="macos-arm64"
+    RUST_TARGET="aarch64-apple-darwin"
+    MAIN_LIB="liblitert-lm.dylib"
+    ;;
+  *)
+    echo "limrun-build.sh: Unsupported host ${HOST_OS}/${HOST_ARCH} (use Cargo download-native on Windows)." >&2
+    exit 1
+    ;;
+esac
+
 CRATE_VERSION="$(sed -n 's/^version = "\([^"]*\)"/\1/p' "$REPO_DIR/Cargo.toml" | head -n1)"
-CRATE_VERSION="${CRATE_VERSION:-0.3.0}"
-PUBLIC_RELEASE_URL="https://github.com/maceip/litert-lm-rust/releases/download/v${CRATE_VERSION}/litert-lm-v${CRATE_VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+CRATE_VERSION="${CRATE_VERSION:-0.3.1}"
+PUBLIC_RELEASE_URL="https://github.com/maceip/litert-lm-rust/releases/download/v${CRATE_VERSION}/litert-lm-v${CRATE_VERSION}-${RUST_TARGET}.tar.gz"
 
 SHORT_REF="${UPSTREAM_REF:0:12}"
-ASSET_NAME="litert-lm-linux-x86_64-${SHORT_REF}.tar.gz"
+ASSET_NAME="litert-lm-${PLATFORM_SLUG}-${SHORT_REF}.tar.gz"
+SHA_ASSET_NAME="${ASSET_NAME}.sha256"
 PREBUILT_DIR="$REPO_DIR/prebuilt"
 STAMP_FILE="$PREBUILT_DIR/.limrun-stamp"
 
-verify_litert_archive() {
-  local archive="$1"
-  if [[ "$UPSTREAM_REF" == "$PINNED_REF" ]]; then
-    local actual
-    actual="$(sha256sum "$archive" | awk '{print $1}')"
-    if [[ "$actual" != "$PINNED_SHA256" ]]; then
-      echo "[limrun-litert-lm] SHA-256 mismatch on $archive: got $actual, expected $PINNED_SHA256" >&2
-      return 1
+if [[ "$FORCE_REBUILD" -eq 0 && -f "$PREBUILT_DIR/$MAIN_LIB" && -f "$STAMP_FILE" ]]; then
+  if [[ "$(cat "$STAMP_FILE")" == "$ASSET_NAME" ]]; then
+    if [[ "$HOST_OS" != "Linux" ]] || readelf -d "$PREBUILT_DIR/liblitert-lm.so" 2>/dev/null | grep -E 'RPATH|RUNPATH' | grep -q '\$ORIGIN'; then
+      echo "[limrun-litert-lm] Already hydrated ($ASSET_NAME) in $PREBUILT_DIR"
+      exit 0
     fi
-  fi
-  return 0
-}
-
-if [[ "$FORCE_REBUILD" -eq 0 && -f "$PREBUILT_DIR/liblitert-lm.so" && -f "$STAMP_FILE" ]]; then
-  if [[ "$(cat "$STAMP_FILE")" == "$ASSET_NAME" ]] \
-     && readelf -d "$PREBUILT_DIR/liblitert-lm.so" 2>/dev/null | grep -E 'RPATH|RUNPATH' | grep -q '\$ORIGIN'; then
-    echo "[limrun-litert-lm] Already hydrated ($ASSET_NAME) in $PREBUILT_DIR"
-    exit 0
   fi
 fi
 
-TMP_WORK="$(mktemp -d /tmp/limrun-litert.XXXXXX)"
+TMP_WORK="$(mktemp -d "${TMPDIR:-/tmp}/limrun-litert.XXXXXX")"
 cleanup() {
   rm -rf "$TMP_WORK"
   if [[ "$KEEP_SANDBOX" -eq 0 && -n "${SANDBOX_ID:-}" ]]; then
@@ -140,6 +155,23 @@ cleanup() {
   fi
 }
 trap cleanup EXIT
+
+verify_sidecar_file() {
+  local archive="$1"
+  local sidecar="$2"
+  local expected actual
+  expected="$(awk '{print tolower($1)}' "$sidecar")"
+  if [[ "${#expected}" -ne 64 ]]; then
+    echo "[limrun-litert-lm] Malformed SHA-256 sidecar: $sidecar" >&2
+    return 1
+  fi
+  actual="$(sha256_hex "$archive")"
+  if [[ "$actual" != "$expected" ]]; then
+    echo "[limrun-litert-lm] SHA-256 mismatch on $archive: got $actual, expected $expected" >&2
+    return 1
+  fi
+  return 0
+}
 
 if [[ "$FORCE_REBUILD" -eq 0 ]]; then
   if command -v lim >/dev/null 2>&1 && { [[ -n "${LIM_API_KEY:-}" ]] || [[ -s "$HOME/.lim/config.yaml" ]] || [[ -s "$HOME/.gemini/lim/config.yaml" ]] || [[ -f "$REPO_DIR/.limrun.env" ]]; }; then
@@ -149,20 +181,30 @@ if [[ "$FORCE_REBUILD" -eq 0 ]]; then
       const items = JSON.parse(require("fs").readFileSync(0, "utf8") || "[]");
       process.stdout.write(items[0]?.id || "");
     ' || true)"
-    if [[ -n "$ASSET_ID" ]] && lim asset pull "$ASSET_ID" -o "$TMP_WORK" >/dev/null \
-       && verify_litert_archive "$TMP_WORK/$ASSET_NAME"; then
-      mkdir -p "$PREBUILT_DIR"
-      tar -xzf "$TMP_WORK/$ASSET_NAME" -C "$PREBUILT_DIR"
-      printf '%s\n' "$ASSET_NAME" > "$STAMP_FILE"
-      echo "[limrun-litert-lm] Hydrated $PREBUILT_DIR from Limrun Asset Storage ($ASSET_NAME, $ASSET_ID)"
-      exit 0
+    SHA_ID="$(lim asset list --name "$SHA_ASSET_NAME" --json 2>/dev/null | node -e '
+      const items = JSON.parse(require("fs").readFileSync(0, "utf8") || "[]");
+      process.stdout.write(items[0]?.id || "");
+    ' || true)"
+    if [[ -n "$ASSET_ID" ]] && lim asset pull "$ASSET_ID" -o "$TMP_WORK" >/dev/null; then
+      SIDECAR_OK=1
+      if [[ -n "$SHA_ID" ]] && lim asset pull "$SHA_ID" -o "$TMP_WORK" >/dev/null 2>&1; then
+        verify_sidecar_file "$TMP_WORK/$ASSET_NAME" "$TMP_WORK/$SHA_ASSET_NAME" || SIDECAR_OK=0
+      fi
+      if [[ "$SIDECAR_OK" -eq 1 ]]; then
+        mkdir -p "$PREBUILT_DIR"
+        tar -xzf "$TMP_WORK/$ASSET_NAME" -C "$PREBUILT_DIR"
+        printf '%s\n' "$ASSET_NAME" > "$STAMP_FILE"
+        echo "[limrun-litert-lm] Hydrated $PREBUILT_DIR from Limrun Asset Storage ($ASSET_NAME, $ASSET_ID)"
+        exit 0
+      fi
     fi
   fi
 
   if [[ "$UPSTREAM_REF" == "$PINNED_REF" ]]; then
-    echo "[limrun-litert-lm] Downloading SHA-256-pinned public GitHub Release ($PUBLIC_RELEASE_URL)..."
-    if curl -fsSL --retry 3 "$PUBLIC_RELEASE_URL" -o "$TMP_WORK/$ASSET_NAME" \
-       && verify_litert_archive "$TMP_WORK/$ASSET_NAME"; then
+    echo "[limrun-litert-lm] Downloading SHA-256-verified public GitHub Release ($PUBLIC_RELEASE_URL)..."
+    if curl -fsSL --retry 3 "${PUBLIC_RELEASE_URL}.sha256" -o "$TMP_WORK/release.sha256" \
+       && curl -fsSL --retry 3 "$PUBLIC_RELEASE_URL" -o "$TMP_WORK/$ASSET_NAME" \
+       && verify_sidecar_file "$TMP_WORK/$ASSET_NAME" "$TMP_WORK/release.sha256"; then
       mkdir -p "$PREBUILT_DIR"
       tar -xzf "$TMP_WORK/$ASSET_NAME" -C "$PREBUILT_DIR"
       printf '%s\n' "$ASSET_NAME" > "$STAMP_FILE"
@@ -172,9 +214,14 @@ if [[ "$FORCE_REBUILD" -eq 0 ]]; then
   fi
 
   if [[ "$HYDRATE_ONLY" -eq 1 ]]; then
-    echo "[limrun-litert-lm] Asset $ASSET_NAME not found in Limrun Asset Storage (--hydrate-only set)." >&2
+    echo "[limrun-litert-lm] Asset $ASSET_NAME not found in Limrun Asset Storage or GitHub Release (--hydrate-only set)." >&2
     exit 1
   fi
+fi
+
+if [[ "$HOST_OS" != "Linux" ]]; then
+  echo "limrun-build.sh: Remote source rebuild is Linux x86_64; use GitHub Actions release-native.yml for macOS/Windows." >&2
+  exit 1
 fi
 
 ensure_lim_auth
@@ -194,16 +241,20 @@ fi
 
 env -C "$TMP_WORK/ws" lim gradle sync --id "$SANDBOX_ID" >/dev/null
 
-BUILD_ARGS=(
-  build //c:litert-lm
-  --config=linux
-  --jobs=96
-  --build_tag_filters=-android
-  --copt=-D_GLIBCXX_USE_CXX11_ABI=1
-  --linkopt=-L/tmp/static-cxx
-  --linkopt=-Wl,--exclude-libs,libstdc++.a
-  --linkopt=-Wl,-rpath,\$ORIGIN
-)
+CACHE_TOKEN="$(lim access-token create --permission 'remotecache:*:all' --permission 'remoteexecution:*:all' --ttl-seconds 3600 --quiet || true)"
+SETUP_JSON="$(NODE_USE_ENV_PROXY=1 node -e '
+  const path = require("path"), fs = require("fs"), cp = require("child_process");
+  const limBin = fs.realpathSync(cp.execFileSync("which", ["lim"], { encoding: "utf8" }).trim());
+  const limRoot = path.resolve(path.dirname(limBin), "..");
+  const Limrun = require(path.join(limRoot, "node_modules/@limrun/api")).default;
+  const { readConfig } = require(path.join(limRoot, "dist/lib/config"));
+  const { getBazelSetup } = require(path.join(limRoot, "dist/lib/bazel-setup"));
+  const cfg = readConfig();
+  const client = new Limrun({ apiKey: process.env.LIM_API_KEY || cfg.apiKey, baseURL: cfg.apiEndpoint });
+  getBazelSetup(client).then(j => process.stdout.write(JSON.stringify(j))).catch(() => process.stdout.write("{}"));
+' || echo '{}')"
+RBE_ENDPOINT="$(node -e 'process.stdout.write(JSON.parse(require("fs").readFileSync(0, "utf8")).endpoint || "")' <<<"$SETUP_JSON")"
+RBE_INSTANCE="$(node -e 'process.stdout.write(JSON.parse(require("fs").readFileSync(0, "utf8")).instanceName || "")' <<<"$SETUP_JSON")"
 
 pass=0
 while true; do
@@ -216,6 +267,9 @@ while true; do
     --timeout 420 \
     --env "UPSTREAM_REPO=$UPSTREAM_REPO" \
     --env "UPSTREAM_REF=$UPSTREAM_REF" \
+    --env "LIM_CACHE_TOKEN=$CACHE_TOKEN" \
+    --env "RBE_ENDPOINT=$RBE_ENDPOINT" \
+    --env "RBE_INSTANCE=$RBE_INSTANCE" \
     -- bash -ce '
       mkdir -p "$HOME/.local/bin"
       export PATH="$HOME/.local/bin:$PATH"
@@ -273,17 +327,34 @@ CEOF
         cp -f "$(clang++ -print-file-name=libstdc++.a)" /tmp/static-cxx/libstdc++.so
         ar rcs /tmp/static-cxx/libstdc++.so /tmp/litert_glibc_compat.o
       fi
+      CACHE_FLAGS=()
+      if [ -n "${RBE_ENDPOINT:-}" ] && [ -n "${LIM_CACHE_TOKEN:-}" ]; then
+        CACHE_FLAGS=(
+          --remote_cache="$RBE_ENDPOINT"
+          --remote_instance_name="$RBE_INSTANCE"
+          --remote_header="Authorization=Bearer $LIM_CACHE_TOKEN"
+          --remote_upload_local_results=true
+          --remote_cache_compression
+          --remote_local_fallback=true
+        )
+      fi
       cd /tmp/LiteRT-LM
       timeout --signal=INT --kill-after=15 300 bazel \
         --output_user_root=/tmp/bazel-litert \
-        build //c:litert-lm \
-        --config=linux \
-        --jobs=96 \
-        --build_tag_filters=-android \
-        --copt=-D_GLIBCXX_USE_CXX11_ABI=1 \
+        build "${CACHE_FLAGS[@]}" \
+        --repo_env=GIT_LFS_SKIP_SMUDGE=1 \
+        --config=linux_x86_64 \
+        --cxxopt=-std=c++20 \
+        --host_cxxopt=-std=c++20 \
+        --java_runtime_version=remotejdk_17 \
+        --linkopt=/tmp/litert_glibc_compat.o \
         --linkopt=-L/tmp/static-cxx \
-        --linkopt=-Wl,--exclude-libs,libstdc++.a \
-        --linkopt='\''-Wl,-rpath,$ORIGIN'\''
+        --linkopt=-Wl,--exclude-libs,libstdc++.so:libstdc++.a \
+        --linkopt=-Wl,--defsym=pidfd_spawnp=0 \
+        --linkopt=-Wl,--defsym=pidfd_getpid=0 \
+        --linkopt='\''-Wl,-rpath,$ORIGIN'\'' \
+        --jobs=96 \
+        //c:litert-lm
     '
   rc=$?
   set -e
@@ -307,25 +378,33 @@ env -C "$TMP_WORK/ws" lim gradle run \
     rm -rf /tmp/litert-pkg
     mkdir -p /tmp/litert-pkg
     cp -L bazel-bin/c/liblitert-lm.so /tmp/litert-pkg/liblitert-lm.so
-    ln -sf liblitert-lm.so /tmp/litert-pkg/litert-lm.so
     if [ -d prebuilt/linux_x86_64 ]; then
       cp -L prebuilt/linux_x86_64/*.so /tmp/litert-pkg/ 2>/dev/null || true
     fi
+    (command -v patchelf >/dev/null 2>&1 || (sudo apt-get update && sudo apt-get install -y patchelf))
+    for so in /tmp/litert-pkg/*.so; do
+      [ -f "$so" ] && chmod 0755 "$so" && patchelf --set-rpath "\$ORIGIN" "$so"
+    done
+    ln -sf liblitert-lm.so /tmp/litert-pkg/litert-lm.so
     cp -L LICENSE /tmp/litert-pkg/LICENSE 2>/dev/null || true
-    chmod 0755 /tmp/litert-pkg/*.so 2>/dev/null || true
     printf "{\"upstream_repo\":\"google-ai-edge/LiteRT-LM\",\"upstream_sha\":\"%s\",\"platform\":\"linux-x86_64\"}\n" "$UPSTREAM_REF" > /tmp/litert-pkg/BUILD_INFO.json
     tar -czf "$WORKSPACE_OUT/litert-lm-out.tar.gz" -C /tmp/litert-pkg .
   '
 
 env -C "$TMP_WORK/ws" lim gradle pull-file litert-lm-out.tar.gz "$TMP_WORK/$ASSET_NAME" --id "$SANDBOX_ID"
-for old_id in $(lim asset list --name "$ASSET_NAME" --json 2>/dev/null | node -e '
-  for (const item of JSON.parse(require("fs").readFileSync(0, "utf8") || "[]")) console.log(item.id);
-' || true); do
-  lim asset delete "$old_id" >/dev/null 2>&1 || true
+printf '%s  %s\n' "$(sha256_hex "$TMP_WORK/$ASSET_NAME")" "$ASSET_NAME" > "$TMP_WORK/$SHA_ASSET_NAME"
+
+for target_name in "$ASSET_NAME" "$SHA_ASSET_NAME"; do
+  for old_id in $(lim asset list --name "$target_name" --json 2>/dev/null | node -e '
+    for (const item of JSON.parse(require("fs").readFileSync(0, "utf8") || "[]")) console.log(item.id);
+  ' || true); do
+    lim asset delete "$old_id" >/dev/null 2>&1 || true
+  done
 done
 lim asset push "$TMP_WORK/$ASSET_NAME" -n "$ASSET_NAME" >/dev/null
+lim asset push "$TMP_WORK/$SHA_ASSET_NAME" -n "$SHA_ASSET_NAME" >/dev/null
 
 mkdir -p "$PREBUILT_DIR"
 tar -xzf "$TMP_WORK/$ASSET_NAME" -C "$PREBUILT_DIR"
 printf '%s\n' "$ASSET_NAME" > "$STAMP_FILE"
-echo "[limrun-litert-lm] Built on Limrun, pushed $ASSET_NAME, and hydrated $PREBUILT_DIR"
+echo "[limrun-litert-lm] Built on Limrun, pushed $ASSET_NAME (+ .sha256), and hydrated $PREBUILT_DIR"

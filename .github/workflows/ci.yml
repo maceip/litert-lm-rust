@@ -21,11 +21,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache Cargo registry and build
-        uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ci-linux-x86_64
 
       - name: Verify published release SLSA provenance and SPDX 2.3 SBOM
         env:
@@ -50,8 +50,6 @@ jobs:
           unset LD_LIBRARY_PATH LITERT_LM_LIB_DIR
           cargo test
           cargo build --examples
-          # Invoke example binary without a model to verify dynamic linker resolves
-          # liblitert-lm.so + companion .so files via embedded rpath and $ORIGIN RUNPATH.
           set +e
           OUT="$(./target/debug/examples/text_chat 2>&1)"
           RC=$?
@@ -69,7 +67,106 @@ jobs:
           if ! ldconfig -p | grep -q libclang && ! compgen -G "/usr/lib/llvm-*/lib/libclang.so*" >/dev/null; then
             sudo apt-get update && sudo apt-get install -y --no-install-recommends clang libclang-dev
           fi
+          chmod +x scripts/limrun-build.sh scripts/fetch-clef-model.sh
           bash -n scripts/limrun-build.sh scripts/fetch-clef-model.sh
           cargo check --no-default-features --features docs-only
           cargo check --no-default-features --features bindgen,docs-only
           cargo package --list >/dev/null
+
+  macos-arm64:
+    name: macOS arm64 (Cargo + SLSA Release Verification)
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ci-macos-arm64
+
+      - name: Verify published release SLSA provenance and SPDX 2.3 SBOM
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          VERSION="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n1)"
+          TAG="v${VERSION}"
+          ARCHIVE="litert-lm-${TAG}-aarch64-apple-darwin.tar.gz"
+          TMP_DL="$(mktemp -d)"
+          trap 'rm -rf "$TMP_DL"' EXIT
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir "$TMP_DL" \
+            -p "$ARCHIVE" -p "SHA256SUMS.txt"
+          (cd "$TMP_DL" && grep "$ARCHIVE" SHA256SUMS.txt | shasum -a 256 -c -)
+          gh attestation verify "$TMP_DL/$ARCHIVE" --repo "$GITHUB_REPOSITORY"
+          gh attestation verify "$TMP_DL/$ARCHIVE" --repo "$GITHUB_REPOSITORY" \
+            --predicate-type https://spdx.dev/Document/v2.3
+
+      - name: Build and test via SHA-256-verified download-native (no DYLD_LIBRARY_PATH)
+        run: |
+          set -euo pipefail
+          unset DYLD_LIBRARY_PATH LITERT_LM_LIB_DIR
+          cargo test
+          cargo build --examples
+          set +e
+          OUT="$(./target/debug/examples/text_chat 2>&1)"
+          RC=$?
+          set -e
+          echo "$OUT"
+          if echo "$OUT" | grep -qi "Library not loaded"; then
+            echo "::error::macOS dyld failed to resolve dynamic libraries"
+            exit 1
+          fi
+          test "$RC" -ne 134 -a "$RC" -ne 137
+
+  windows-x86_64:
+    name: Windows x86_64 (Cargo + SLSA Release Verification)
+    runs-on: windows-2022
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ci-windows-x86_64
+
+      - name: Verify published release SLSA provenance and SPDX 2.3 SBOM
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $ver = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
+          $tag = "v$ver"
+          $archive = "litert-lm-$tag-x86_64-pc-windows-msvc.tar.gz"
+          $tmp = Join-Path $env:RUNNER_TEMP "dl-verify"
+          New-Item -ItemType Directory -Force -Path $tmp | Out-Null
+          gh release download $tag --repo $env:GITHUB_REPOSITORY --dir $tmp -p $archive -p "SHA256SUMS.txt"
+          if ($LASTEXITCODE -ne 0) { throw "gh release download failed" }
+          $expected = (Select-String -Path "$tmp\SHA256SUMS.txt" -Pattern ([regex]::Escape($archive))).Line.Split()[0].ToLowerInvariant()
+          $actual = (Get-FileHash "$tmp\$archive" -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actual -ne $expected) { throw "SHA-256 mismatch: expected $expected, got $actual" }
+          gh attestation verify "$tmp\$archive" --repo $env:GITHUB_REPOSITORY
+          if ($LASTEXITCODE -ne 0) { throw "SLSA attestation verify failed" }
+          gh attestation verify "$tmp\$archive" --repo $env:GITHUB_REPOSITORY --predicate-type https://spdx.dev/Document/v2.3
+          if ($LASTEXITCODE -ne 0) { throw "SPDX SBOM attestation verify failed" }
+
+      - name: Build and test via SHA-256-verified download-native (zero PATH config)
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          Remove-Item Env:LITERT_LM_LIB_DIR -ErrorAction SilentlyContinue
+          cargo test
+          if ($LASTEXITCODE -ne 0) { throw "cargo test failed" }
+          cargo build --examples
+          if ($LASTEXITCODE -ne 0) { throw "cargo build --examples failed" }
+          $proc = Start-Process -FilePath ".\target\debug\examples\text_chat.exe" -NoNewWindow -Wait -PassThru
+          Write-Host "text_chat.exe exit code: $($proc.ExitCode)"
+          if ($proc.ExitCode -eq -1073741515 -or $proc.ExitCode -eq -1073741511) {
+            throw "Windows loader failed to resolve DLLs or entrypoints (exit code $($proc.ExitCode))"
+          }
