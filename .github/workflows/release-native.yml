@@ -99,7 +99,7 @@ jobs:
           SHORT_REF="${UPSTREAM_REF:0:12}"
           mkdir -p /tmp/lim-ws
           printf 'rootProject.name = "litert-lm-ci"\n' > /tmp/lim-ws/settings.gradle
-          SANDBOX_JSON="$(lim gradle create --display-name "litert-lm-${TAG}-${SHORT_REF:0:8}" --label "repo=litert-lm-rust" --json)"
+          SANDBOX_JSON="$(lim gradle create --display-name "litert-lm-${TAG}-${SHORT_REF:0:8}" --inactivity-timeout 30m --hard-timeout 60m --label "repo=litert-lm-rust" --json)"
           SANDBOX_ID="$(node -e 'process.stdout.write(JSON.parse(require("fs").readFileSync(0, "utf8")).metadata.id)' <<<"$SANDBOX_JSON")"
           echo "id=${SANDBOX_ID}" >> "$GITHUB_OUTPUT"
           echo "Created Limrun 96-vCPU sandbox: ${SANDBOX_ID}"
@@ -112,7 +112,8 @@ jobs:
           TAG="${{ steps.meta.outputs.tag }}"
           COMMIT_SHA="${{ steps.meta.outputs.commit_sha }}"
           UPSTREAM_REF="${{ steps.meta.outputs.upstream_ref }}"
-          SHORT_REF="${UPSTREAM_REF:0:12}"
+          SHORT_REF="${{ steps.meta.outputs.upstream_ref }}"
+          SHORT_REF="${SHORT_REF:0:12}"
           UPSTREAM_REPO="https://github.com/google-ai-edge/LiteRT-LM.git"
 
           CACHE_TOKEN="$(lim access-token create --permission 'remotecache:*:all' --permission 'remoteexecution:*:all' --ttl-seconds 3600 --quiet || true)"
@@ -189,42 +190,53 @@ jobs:
               ar rcs /tmp/static-cxx/libstdc++.so /tmp/litert_glibc_compat.o
             '
 
-          env -C /tmp/lim-ws lim gradle run \
-            --id "$SANDBOX_ID" \
-            --no-sync \
-            --timeout 3600 \
-            --env "LIM_CACHE_TOKEN=$CACHE_TOKEN" \
-            --env "RBE_ENDPOINT=$RBE_ENDPOINT" \
-            --env "RBE_INSTANCE=$RBE_INSTANCE" \
-            -- bash -ce '
-              export PATH="$HOME/.local/bin:$PATH"
-              CACHE_FLAGS=()
-              if [ -n "${RBE_ENDPOINT:-}" ] && [ -n "${LIM_CACHE_TOKEN:-}" ]; then
-                CACHE_FLAGS=(
-                  --remote_cache="$RBE_ENDPOINT"
-                  --remote_instance_name="$RBE_INSTANCE"
-                  --remote_header="Authorization=Bearer $LIM_CACHE_TOKEN"
-                  --remote_upload_local_results=true
-                  --remote_cache_compression
-                  --remote_local_fallback=true
-                )
-              fi
-              env -C /tmp/LiteRT-LM bazelisk --output_user_root=/tmp/bazel-litert build \
-                "${CACHE_FLAGS[@]}" \
-                --repo_env=GIT_LFS_SKIP_SMUDGE=1 \
-                --config=linux_x86_64 \
-                --cxxopt=-std=c++20 \
-                --host_cxxopt=-std=c++20 \
-                --java_runtime_version=remotejdk_17 \
-                --linkopt=/tmp/litert_glibc_compat.o \
-                --linkopt=-L/tmp/static-cxx \
-                --linkopt=-Wl,--exclude-libs,libstdc++.so:libstdc++.a \
-                --linkopt=-Wl,--defsym=pidfd_spawnp=0 \
-                --linkopt=-Wl,--defsym=pidfd_getpid=0 \
-                --linkopt='\''-Wl,-rpath,$ORIGIN'\'' \
-                --jobs=96 \
-                //c:litert-lm
-            '
+          BUILT_OK=0
+          for attempt in 1 2 3 4 5; do
+            if env -C /tmp/lim-ws lim gradle run \
+              --id "$SANDBOX_ID" \
+              --no-sync \
+              --timeout 360 \
+              --env "LIM_CACHE_TOKEN=$CACHE_TOKEN" \
+              --env "RBE_ENDPOINT=$RBE_ENDPOINT" \
+              --env "RBE_INSTANCE=$RBE_INSTANCE" \
+              -- bash -ce '
+                export PATH="$HOME/.local/bin:$PATH"
+                CACHE_FLAGS=()
+                if [ -n "${RBE_ENDPOINT:-}" ] && [ -n "${LIM_CACHE_TOKEN:-}" ]; then
+                  CACHE_FLAGS=(
+                    --remote_cache="$RBE_ENDPOINT"
+                    --remote_instance_name="$RBE_INSTANCE"
+                    --remote_header="Authorization=Bearer $LIM_CACHE_TOKEN"
+                    --remote_upload_local_results=true
+                    --remote_cache_compression
+                    --remote_local_fallback=true
+                  )
+                fi
+                timeout 300 env -C /tmp/LiteRT-LM bazelisk --output_user_root=/tmp/bazel-litert build \
+                  "${CACHE_FLAGS[@]}" \
+                  --repo_env=GIT_LFS_SKIP_SMUDGE=1 \
+                  --config=linux_x86_64 \
+                  --cxxopt=-std=c++20 \
+                  --host_cxxopt=-std=c++20 \
+                  --java_runtime_version=remotejdk_17 \
+                  --linkopt=/tmp/litert_glibc_compat.o \
+                  --linkopt=-L/tmp/static-cxx \
+                  --linkopt=-Wl,--exclude-libs,libstdc++.so:libstdc++.a \
+                  --linkopt=-Wl,--defsym=pidfd_spawnp=0 \
+                  --linkopt=-Wl,--defsym=pidfd_getpid=0 \
+                  --linkopt='\''-Wl,-rpath,$ORIGIN'\'' \
+                  --jobs=96 \
+                  //c:litert-lm
+              ' ; then
+              BUILT_OK=1
+              break
+            fi
+            echo "Continuing incremental Bazel build pass (${attempt}/5)..."
+          done
+          if [[ "$BUILT_OK" -ne 1 ]]; then
+            echo "::error::Bazel build of //c:litert-lm did not complete within 5 passes."
+            exit 1
+          fi
 
           env -C /tmp/lim-ws lim gradle run \
             --id "$SANDBOX_ID" \
@@ -238,6 +250,11 @@ jobs:
               rm -rf /tmp/litert-pkg
               mkdir -p /tmp/litert-pkg
               cp -L /tmp/LiteRT-LM/bazel-bin/c/liblitert-lm.so /tmp/litert-pkg/liblitert-lm.so
+              chmod 0755 /tmp/litert-pkg/liblitert-lm.so
+              if ! readelf -d /tmp/litert-pkg/liblitert-lm.so | grep -E "RPATH|RUNPATH" | grep -qF "\$ORIGIN"; then
+                (command -v patchelf >/dev/null 2>&1 || (sudo apt-get update && sudo apt-get install -y patchelf))
+                patchelf --set-rpath "\$ORIGIN" /tmp/litert-pkg/liblitert-lm.so
+              fi
               ln -sfn liblitert-lm.so /tmp/litert-pkg/litert-lm.so
               for f in /tmp/LiteRT-LM/prebuilt/linux_x86_64/*.so; do
                 [ -f "$f" ] && cp -L "$f" /tmp/litert-pkg/
