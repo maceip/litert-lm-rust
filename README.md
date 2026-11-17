@@ -105,15 +105,26 @@ gh attestation verify litert-lm-v0.3.0-x86_64-unknown-linux-gnu.tar.gz --repo ma
 
 On Linux and macOS, `build.rs` embeds `-Wl,-rpath,<dir>` and `liblitert-lm.so` carries `RUNPATH=$ORIGIN`, so executables resolve companion libraries without setting `LD_LIBRARY_PATH`. On Windows, runtime DLLs must be on `PATH` or next to the executable.
 
+### Building or Hydrating via Limrun (`scripts/limrun-build.sh`)
+
+Contributors and cloud agents can hydrate `prebuilt/` from Limrun Asset Storage (falling back to the SHA-256-verified public GitHub Release) or compile `google-ai-edge/LiteRT-LM` (`//c:litert-lm` at `c/UPSTREAM_COMMIT`) on an ephemeral 96-vCPU Limrun sandbox:
+
+```bash
+./scripts/limrun-build.sh                  # hydrate prebuilt/ or build on Limrun
+./scripts/limrun-build.sh --force-rebuild  # rebuild //c:litert-lm on 96-vCPU Limrun sandbox
+./scripts/fetch-clef-model.sh              # fetch/link SHA-256-verified gemma-4-E2B-it.litertlm
+cargo test --test basic -- --ignored --nocapture
+```
+
 ### Manual Setup
 
-If you prefer to build the LiteRT-LM C API from source:
+If you prefer to build the LiteRT-LM C API from source locally:
 
 ```bash
 git clone https://github.com/google-ai-edge/LiteRT-LM
 cd LiteRT-LM
-git checkout <release-tag>   # e.g. v0.14.0
-bazel build //c:engine
+git checkout "$(cat /path/to/litert-lm-rust/c/UPSTREAM_COMMIT)"
+bazel build //c:litert-lm --config=linux
 ```
 
 Then point this crate at the output:
@@ -121,11 +132,9 @@ Then point this crate at the output:
 ```bash
 # Linux
 export LITERT_LM_LIB_DIR=$PWD/bazel-bin/c
-export LITERT_LM_LIB_NAME=engine
 
 # Windows (PowerShell)
 $env:LITERT_LM_LIB_DIR = "C:\path\to\bazel-bin\c"
-$env:LITERT_LM_LIB_NAME = "engine"
 ```
 
 Alternatively, place the shared library in this crate's `c/`, `native/`, or `prebuilt/` folder.
@@ -133,14 +142,14 @@ Alternatively, place the shared library in this crate's `c/`, `native/`, or `pre
 | Variable | Meaning |
 | --- | --- |
 | `LITERT_LM_LIB_DIR` | Directory containing the shared library |
-| `LITERT_LM_LIB_NAME` | Library name without `lib` / extension (default tries `LiteRtLmC` / `engine`) |
+| `LITERT_LM_LIB_NAME` | Library name without `lib` / extension (default tries `litert-lm` / `LiteRtLmC` / `engine`) |
 | `LITERT_LM_STATIC` | If set, link statically |
 | `LITERT_LM_INCLUDE_DIR` | Override header path (defaults to vendored `c/`) |
 
 **Note:** To disable automatic download and use your own libraries, add `default-features = false` to your Cargo.toml:
 ```toml
 [dependencies]
-litert-lm-rust = { version = "0.13", default-features = false }
+litert-lm-rust = { version = "0.3", default-features = false }
 ```
 
 ### Legacy pre‑built Windows binaries
