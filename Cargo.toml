@@ -6,7 +6,7 @@ rust-version = "1.74"
 authors = ["LiteRT-LM Rust Contributors"]
 license = "Apache-2.0"
 description = "Safe, idiomatic Rust bindings for Google's LiteRT-LM on-device LLM runtime (Conversation API, multimodal, MTP)"
-repository = "https://github.com/google-ai-edge/LiteRT-LM"
+repository = "https://github.com/maceip/litert-lm-rust"
 homepage = "https://ai.google.dev/edge/litert-lm"
 documentation = "https://docs.rs/litert-lm-rust"
 readme = "README.md"
@@ -15,12 +15,13 @@ categories = ["api-bindings", "science", "multimedia"]
 links = "LiteRtLmC"
 include = [
     "src/**/*",
-    "c/engine.h",
-    "c/wrapper.h",
+    "c/*.h",
+    "c/UPSTREAM_COMMIT",
     "build.rs",
     "README.md",
     "LICENSE",
     "examples/**/*",
+    "tests/**/*",
     "litert.md",
 ]
 

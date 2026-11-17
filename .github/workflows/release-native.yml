@@ -1,0 +1,570 @@
+name: Release Native Libraries
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to publish (defaults to v<Cargo.toml version>, e.g. v0.3.0)'
+        required: false
+        default: ''
+        type: string
+      upstream_ref:
+        description: 'google-ai-edge/LiteRT-LM commit SHA (defaults to c/UPSTREAM_COMMIT)'
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-native-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-linux-x86_64:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      version: ${{ steps.meta.outputs.version }}
+      upstream_ref: ${{ steps.meta.outputs.upstream_ref }}
+      commit_sha: ${{ steps.meta.outputs.commit_sha }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Resolve release and upstream metadata
+        id: meta
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+          INPUT_UPSTREAM_REF: ${{ inputs.upstream_ref }}
+        run: |
+          set -euo pipefail
+          VERSION="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n1)"
+          if [[ "${GITHUB_REF:-}" == refs/tags/v* ]]; then
+            TAG="${GITHUB_REF_NAME}"
+          elif [[ -n "${INPUT_TAG}" ]]; then
+            TAG="${INPUT_TAG}"
+          else
+            TAG="v${VERSION}"
+          fi
+          if [[ -n "${INPUT_UPSTREAM_REF}" ]]; then
+            UPSTREAM_REF="${INPUT_UPSTREAM_REF}"
+          else
+            UPSTREAM_REF="$(tr -d ' \n\r' < c/UPSTREAM_COMMIT)"
+          fi
+          COMMIT_SHA="$(git rev-parse HEAD)"
+          {
+            echo "version=${VERSION}"
+            echo "tag=${TAG}"
+            echo "upstream_ref=${UPSTREAM_REF}"
+            echo "commit_sha=${COMMIT_SHA}"
+          } >> "$GITHUB_OUTPUT"
+          echo "Resolved release tag=${TAG}, crate version=${VERSION}, upstream LiteRT-LM=${UPSTREAM_REF}"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install and authenticate Limrun CLI
+        env:
+          LIM_API_KEY: ${{ secrets.LIM_API_KEY }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${LIM_API_KEY:-}" ]]; then
+            echo "::error::Missing LIM_API_KEY repository secret required to provision Limrun build sandboxes."
+            exit 1
+          fi
+          npm install -g lim --no-audit --no-fund
+          lim set-api-key "$LIM_API_KEY" >/dev/null
+          lim version
+
+      - name: Create ephemeral 96-vCPU Limrun Linux sandbox
+        id: sandbox
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.meta.outputs.tag }}"
+          UPSTREAM_REF="${{ steps.meta.outputs.upstream_ref }}"
+          SHORT_REF="${UPSTREAM_REF:0:12}"
+          mkdir -p /tmp/lim-ws
+          printf 'rootProject.name = "litert-lm-ci"\n' > /tmp/lim-ws/settings.gradle
+          SANDBOX_JSON="$(lim gradle create --display-name "litert-lm-${TAG}-${SHORT_REF:0:8}" --label "repo=litert-lm-rust" --json)"
+          SANDBOX_ID="$(node -e 'process.stdout.write(JSON.parse(require("fs").readFileSync(0, "utf8")).metadata.id)' <<<"$SANDBOX_JSON")"
+          echo "id=${SANDBOX_ID}" >> "$GITHUB_OUTPUT"
+          echo "Created Limrun 96-vCPU sandbox: ${SANDBOX_ID}"
+          env -C /tmp/lim-ws lim gradle sync --id "$SANDBOX_ID" >/dev/null
+
+      - name: Build portable LiteRT-LM C API shared libraries on Limrun
+        run: |
+          set -euo pipefail
+          SANDBOX_ID="${{ steps.sandbox.outputs.id }}"
+          TAG="${{ steps.meta.outputs.tag }}"
+          COMMIT_SHA="${{ steps.meta.outputs.commit_sha }}"
+          UPSTREAM_REF="${{ steps.meta.outputs.upstream_ref }}"
+          SHORT_REF="${UPSTREAM_REF:0:12}"
+          UPSTREAM_REPO="https://github.com/google-ai-edge/LiteRT-LM.git"
+
+          CACHE_TOKEN="$(lim access-token create --permission 'remotecache:*:all' --permission 'remoteexecution:*:all' --ttl-seconds 3600 --quiet || true)"
+          SETUP_JSON="$(node -e '
+            const path = require("path"), fs = require("fs"), cp = require("child_process");
+            const limBin = fs.realpathSync(cp.execFileSync("which", ["lim"], { encoding: "utf8" }).trim());
+            const limRoot = path.resolve(path.dirname(limBin), "..");
+            const Limrun = require(path.join(limRoot, "node_modules/@limrun/api")).default;
+            const { readConfig } = require(path.join(limRoot, "dist/lib/config"));
+            const { getBazelSetup } = require(path.join(limRoot, "dist/lib/bazel-setup"));
+            const cfg = readConfig();
+            const client = new Limrun({ apiKey: cfg.apiKey, baseURL: cfg.apiEndpoint });
+            getBazelSetup(client).then(j => process.stdout.write(JSON.stringify(j))).catch(() => process.stdout.write("{}"));
+          ' || echo '{}')"
+          RBE_ENDPOINT="$(node -e 'process.stdout.write(JSON.parse(require("fs").readFileSync(0, "utf8")).endpoint || "")' <<<"$SETUP_JSON")"
+          RBE_INSTANCE="$(node -e 'process.stdout.write(JSON.parse(require("fs").readFileSync(0, "utf8")).instanceName || "")' <<<"$SETUP_JSON")"
+
+          env -C /tmp/lim-ws lim gradle run \
+            --id "$SANDBOX_ID" \
+            --no-sync \
+            --timeout 3600 \
+            --env "UPSTREAM_REPO=$UPSTREAM_REPO" \
+            --env "UPSTREAM_REF=$UPSTREAM_REF" \
+            -- bash -ce '
+              mkdir -p "$HOME/.local/bin"
+              export PATH="$HOME/.local/bin:$PATH"
+              if ! command -v bazelisk >/dev/null 2>&1; then
+                curl -fsSL https://github.com/bazelbuild/bazelisk/releases/download/v1.25.0/bazelisk-linux-amd64 -o "$HOME/.local/bin/bazelisk"
+                chmod +x "$HOME/.local/bin/bazelisk"
+                ln -sfn "$HOME/.local/bin/bazelisk" "$HOME/.local/bin/bazel"
+              fi
+              GIT_LFS_SKIP_SMUDGE=1 git clone --no-checkout "$UPSTREAM_REPO" /tmp/LiteRT-LM
+              git -C /tmp/LiteRT-LM fetch --depth 1 origin "$UPSTREAM_REF"
+              GIT_LFS_SKIP_SMUDGE=1 git -C /tmp/LiteRT-LM checkout -f FETCH_HEAD
+              git -C /tmp/LiteRT-LM lfs pull --include="prebuilt/linux_x86_64/*"
+
+              cat > /tmp/litert_glibc_compat.c <<'\''CEOF'\''
+          long compat_strtol(const char *, char **, int);
+          unsigned long compat_strtoul(const char *, char **, int);
+          long long compat_strtoll(const char *, char **, int);
+          unsigned long long compat_strtoull(const char *, char **, int);
+          long long compat_strtoll_l(const char *, char **, int, void *);
+          unsigned long long compat_strtoull_l(const char *, char **, int, void *);
+          int compat_vsscanf(const char *, const char *, __builtin_va_list);
+          double compat_fmod(double, double);
+          float compat_fmodf(float, float);
+
+          __asm__(".symver compat_strtol, strtol@GLIBC_2.2.5");
+          __asm__(".symver compat_strtoul, strtoul@GLIBC_2.2.5");
+          __asm__(".symver compat_strtoll, strtoll@GLIBC_2.2.5");
+          __asm__(".symver compat_strtoull, strtoull@GLIBC_2.2.5");
+          __asm__(".symver compat_strtoll_l, strtoll_l@GLIBC_2.3.3");
+          __asm__(".symver compat_strtoull_l, strtoull_l@GLIBC_2.3.3");
+          __asm__(".symver compat_vsscanf, vsscanf@GLIBC_2.2.5");
+          __asm__(".symver compat_fmod, fmod@GLIBC_2.2.5");
+          __asm__(".symver compat_fmodf, fmodf@GLIBC_2.2.5");
+
+          __attribute__((visibility("hidden"))) long __isoc23_strtol(const char *n, char **e, int b) { return compat_strtol(n, e, b); }
+          __attribute__((visibility("hidden"))) unsigned long __isoc23_strtoul(const char *n, char **e, int b) { return compat_strtoul(n, e, b); }
+          __attribute__((visibility("hidden"))) long long __isoc23_strtoll(const char *n, char **e, int b) { return compat_strtoll(n, e, b); }
+          __attribute__((visibility("hidden"))) unsigned long long __isoc23_strtoull(const char *n, char **e, int b) { return compat_strtoull(n, e, b); }
+          __attribute__((visibility("hidden"))) long long __isoc23_strtoll_l(const char *n, char **e, int b, void *l) { return compat_strtoll_l(n, e, b, l); }
+          __attribute__((visibility("hidden"))) unsigned long long __isoc23_strtoull_l(const char *n, char **e, int b, void *l) { return compat_strtoull_l(n, e, b, l); }
+          __attribute__((visibility("hidden"))) int __isoc23_vsscanf(const char *s, const char *f, __builtin_va_list ap) { return compat_vsscanf(s, f, ap); }
+          __attribute__((visibility("hidden"))) int __isoc23_sscanf(const char *s, const char *f, ...) {
+            __builtin_va_list ap; __builtin_va_start(ap, f); int r = compat_vsscanf(s, f, ap); __builtin_va_end(ap); return r;
+          }
+          __attribute__((visibility("hidden"))) double fmod(double x, double y) { return compat_fmod(x, y); }
+          __attribute__((visibility("hidden"))) float fmodf(float x, float y) { return compat_fmodf(x, y); }
+          CEOF
+              clang -O2 -fPIC -fno-builtin -c /tmp/litert_glibc_compat.c -o /tmp/litert_glibc_compat.o
+              mkdir -p /tmp/static-cxx
+              cp -f "$(clang++ -print-file-name=libstdc++.a)" /tmp/static-cxx/libstdc++.so
+              ar rcs /tmp/static-cxx/libstdc++.so /tmp/litert_glibc_compat.o
+            '
+
+          env -C /tmp/lim-ws lim gradle run \
+            --id "$SANDBOX_ID" \
+            --no-sync \
+            --timeout 3600 \
+            --env "LIM_CACHE_TOKEN=$CACHE_TOKEN" \
+            --env "RBE_ENDPOINT=$RBE_ENDPOINT" \
+            --env "RBE_INSTANCE=$RBE_INSTANCE" \
+            -- bash -ce '
+              export PATH="$HOME/.local/bin:$PATH"
+              CACHE_FLAGS=()
+              if [ -n "${RBE_ENDPOINT:-}" ] && [ -n "${LIM_CACHE_TOKEN:-}" ]; then
+                CACHE_FLAGS=(
+                  --remote_cache="$RBE_ENDPOINT"
+                  --remote_instance_name="$RBE_INSTANCE"
+                  --remote_header="Authorization=Bearer $LIM_CACHE_TOKEN"
+                  --remote_upload_local_results=true
+                  --remote_cache_compression
+                  --remote_local_fallback=true
+                )
+              fi
+              env -C /tmp/LiteRT-LM bazelisk --output_user_root=/tmp/bazel-litert build \
+                "${CACHE_FLAGS[@]}" \
+                --repo_env=GIT_LFS_SKIP_SMUDGE=1 \
+                --config=linux_x86_64 \
+                --cxxopt=-std=c++20 \
+                --host_cxxopt=-std=c++20 \
+                --java_runtime_version=remotejdk_17 \
+                --linkopt=/tmp/litert_glibc_compat.o \
+                --linkopt=-L/tmp/static-cxx \
+                --linkopt=-Wl,--exclude-libs,libstdc++.so:libstdc++.a \
+                --linkopt=-Wl,--defsym=pidfd_spawnp=0 \
+                --linkopt=-Wl,--defsym=pidfd_getpid=0 \
+                --linkopt='\''-Wl,-rpath,$ORIGIN'\'' \
+                --jobs=96 \
+                //c:litert-lm
+            '
+
+          env -C /tmp/lim-ws lim gradle run \
+            --id "$SANDBOX_ID" \
+            --no-sync \
+            --env "TAG=$TAG" \
+            --env "COMMIT_SHA=$COMMIT_SHA" \
+            --env "UPSTREAM_REF=$UPSTREAM_REF" \
+            --env "REPO_SLUG=$GITHUB_REPOSITORY" \
+            -- bash -ce '
+              WORKSPACE_OUT="$PWD"
+              rm -rf /tmp/litert-pkg
+              mkdir -p /tmp/litert-pkg
+              cp -L /tmp/LiteRT-LM/bazel-bin/c/liblitert-lm.so /tmp/litert-pkg/liblitert-lm.so
+              ln -sfn liblitert-lm.so /tmp/litert-pkg/litert-lm.so
+              for f in /tmp/LiteRT-LM/prebuilt/linux_x86_64/*.so; do
+                [ -f "$f" ] && cp -L "$f" /tmp/litert-pkg/
+              done
+              cp -L /tmp/LiteRT-LM/LICENSE /tmp/litert-pkg/LICENSE
+              chmod 0755 /tmp/litert-pkg/*.so
+              cat > /tmp/litert-pkg/BUILD_INFO.json <<JSON
+          {
+            "repository": "${REPO_SLUG}",
+            "tag": "${TAG}",
+            "git_commit": "${COMMIT_SHA}",
+            "upstream_repo": "google-ai-edge/LiteRT-LM",
+            "upstream_sha": "${UPSTREAM_REF}",
+            "target": "x86_64-unknown-linux-gnu"
+          }
+          JSON
+              tar -czf "$WORKSPACE_OUT/litert-lm-out.tar.gz" -C /tmp/litert-pkg .
+            '
+
+          mkdir -p /tmp/pulled
+          env -C /tmp/lim-ws lim gradle pull-file litert-lm-out.tar.gz /tmp/pulled/litert-lm-out.tar.gz
+
+          ASSET_NAME="litert-lm-linux-x86_64-${SHORT_REF}.tar.gz"
+          cp /tmp/pulled/litert-lm-out.tar.gz "/tmp/pulled/$ASSET_NAME"
+          for old_id in $(lim asset list --name "$ASSET_NAME" --json 2>/dev/null | node -e '
+            for (const item of JSON.parse(require("fs").readFileSync(0, "utf8") || "[]")) console.log(item.id);
+          ' || true); do
+            lim asset delete "$old_id" >/dev/null 2>&1 || true
+          done
+          lim asset push "/tmp/pulled/$ASSET_NAME" -n "$ASSET_NAME" >/dev/null
+
+      - name: Verify ELF portability, C API ABI coverage, and Cargo test suite
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/verify-native
+          tar -xzf /tmp/pulled/litert-lm-out.tar.gz -C /tmp/verify-native
+
+          echo "=== Verify $ORIGIN RUNPATH on liblitert-lm.so ==="
+          readelf -d /tmp/verify-native/liblitert-lm.so | grep -E 'RPATH|RUNPATH' | grep -F '$ORIGIN'
+
+          echo "=== Verify glibc symbol ceiling (<= 2.36) and 100% C API symbol coverage ==="
+          python3 - <<'PY'
+          import glob, re, subprocess, sys
+
+          for so in sorted(glob.glob("/tmp/verify-native/*.so")):
+              out = subprocess.check_output(["objdump", "-T", so], text=True)
+              versions = set()
+              for m in re.finditer(r'GLIBC_(\d+)\.(\d+)(?:\.(\d+))?', out):
+                  versions.add((int(m.group(1)), int(m.group(2)), int(m.group(3) or 0)))
+              max_v = max(versions) if versions else (0, 0, 0)
+              print(f"{so}: max GLIBC_{max_v[0]}.{max_v[1]}.{max_v[2]}")
+              if max_v > (2, 36, 0):
+                  sys.exit(f"GLIBC version too new in {so}: {max_v}")
+
+          with open("src/bindings.rs") as f:
+              want = sorted(set(re.findall(r'\blitert_lm_[a-z0-9_]+\b', f.read())))
+          nm = subprocess.check_output(["nm", "-D", "--defined-only", "/tmp/verify-native/liblitert-lm.so"], text=True)
+          have = {line.split()[-1].split("@")[0] for line in nm.splitlines() if line.strip()}
+          missing = [s for s in want if s not in have]
+          print(f"Verified {len(want) - len(missing)}/{len(want)} C API functions exported by liblitert-lm.so")
+          if missing:
+              sys.exit(f"Missing C API functions: {missing}")
+          PY
+
+          echo "=== Run Cargo test suite & build examples with LD_LIBRARY_PATH unset ==="
+          env -u LD_LIBRARY_PATH LITERT_LM_LIB_DIR=/tmp/verify-native cargo test --no-default-features
+          env -u LD_LIBRARY_PATH LITERT_LM_LIB_DIR=/tmp/verify-native cargo build --examples --no-default-features
+
+      - name: Stage release artifacts, SHA-256 checksums, and SPDX 2.3 SBOM
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.meta.outputs.tag }}"
+          VERSION="${{ steps.meta.outputs.version }}"
+          COMMIT_SHA="${{ steps.meta.outputs.commit_sha }}"
+          UPSTREAM_REF="${{ steps.meta.outputs.upstream_ref }}"
+          TARGET="x86_64-unknown-linux-gnu"
+          ARCHIVE="litert-lm-${TAG}-${TARGET}.tar.gz"
+
+          rm -rf dist
+          mkdir -p dist
+          cp /tmp/pulled/litert-lm-out.tar.gz "dist/${ARCHIVE}"
+          cp /tmp/verify-native/liblitert-lm.so dist/liblitert-lm.so
+          cp /tmp/verify-native/libGemmaModelConstraintProvider.so dist/libGemmaModelConstraintProvider.so
+          cp /tmp/verify-native/libwebgpu_dawn.so dist/libwebgpu_dawn.so
+
+          (
+            cd dist
+            for f in "${ARCHIVE}" liblitert-lm.so libGemmaModelConstraintProvider.so libwebgpu_dawn.so; do
+              sha256sum "$f" > "${f}.sha256"
+            done
+            cat "${ARCHIVE}.sha256" \
+                liblitert-lm.so.sha256 \
+                libGemmaModelConstraintProvider.so.sha256 \
+                libwebgpu_dawn.so.sha256 > SHA256SUMS.txt
+          )
+
+          node - "$TAG" "$VERSION" "$TARGET" "$COMMIT_SHA" "$UPSTREAM_REF" "$GITHUB_REPOSITORY" <<'NODE'
+          const fs = require("fs");
+          const crypto = require("crypto");
+          const [tag, version, target, commitSha, upstreamRef, repoSlug] = process.argv.slice(2);
+          const archive = `litert-lm-${tag}-${target}.tar.gz`;
+          const sha256 = (p) => crypto.createHash("sha256").update(fs.readFileSync(p)).digest("hex");
+          const archiveSha = sha256(`dist/${archive}`);
+          const created = new Date().toISOString().replace(/\.\d{3}Z$/, "Z");
+          const baseUrl = `https://github.com/${repoSlug}/releases/download/${tag}`;
+
+          const files = [
+            "liblitert-lm.so",
+            "libGemmaModelConstraintProvider.so",
+            "libwebgpu_dawn.so",
+          ];
+
+          const packages = [
+            {
+              name: `litert-lm-${target}`,
+              SPDXID: "SPDXRef-ReleaseArchive",
+              versionInfo: version,
+              downloadLocation: `${baseUrl}/${archive}`,
+              filesAnalyzed: false,
+              licenseConcluded: "Apache-2.0",
+              licenseDeclared: "Apache-2.0",
+              copyrightText: "Copyright The ODML Authors / Google LLC",
+              checksums: [{ algorithm: "SHA256", checksumValue: archiveSha }],
+              externalRefs: [
+                {
+                  referenceCategory: "PACKAGE-MANAGER",
+                  referenceType: "purl",
+                  referenceLocator: `pkg:github/${repoSlug}@${tag}?arch=x86_64&os=linux`,
+                },
+              ],
+            },
+            {
+              name: "google-ai-edge-litert-lm",
+              SPDXID: "SPDXRef-UpstreamLiteRtLm",
+              versionInfo: upstreamRef,
+              downloadLocation: `git+https://github.com/google-ai-edge/LiteRT-LM.git@${upstreamRef}`,
+              filesAnalyzed: false,
+              licenseConcluded: "Apache-2.0",
+              licenseDeclared: "Apache-2.0",
+              copyrightText: "Copyright The ODML Authors / Google LLC",
+            },
+          ];
+
+          const relationships = [
+            {
+              spdxElementId: "SPDXRef-DOCUMENT",
+              relationshipType: "DESCRIBES",
+              relatedSpdxElement: "SPDXRef-ReleaseArchive",
+            },
+            {
+              spdxElementId: "SPDXRef-ReleaseArchive",
+              relationshipType: "GENERATED_FROM",
+              relatedSpdxElement: "SPDXRef-UpstreamLiteRtLm",
+            },
+          ];
+
+          for (const file of files) {
+            const id = `SPDXRef-${file.replace(/[^A-Za-z0-9.-]+/g, "-")}`;
+            packages.push({
+              name: file,
+              SPDXID: id,
+              versionInfo: version,
+              downloadLocation: `${baseUrl}/${file}`,
+              filesAnalyzed: false,
+              licenseConcluded: "Apache-2.0",
+              licenseDeclared: "Apache-2.0",
+              copyrightText: "Copyright The ODML Authors / Google LLC",
+              checksums: [{ algorithm: "SHA256", checksumValue: sha256(`dist/${file}`) }],
+            });
+            relationships.push({
+              spdxElementId: "SPDXRef-ReleaseArchive",
+              relationshipType: "CONTAINS",
+              relatedSpdxElement: id,
+            });
+          }
+
+          const sbom = {
+            spdxVersion: "SPDX-2.3",
+            dataLicense: "CC0-1.0",
+            SPDXID: "SPDXRef-DOCUMENT",
+            name: `litert-lm-${tag}-${target}`,
+            documentNamespace: `${baseUrl}/${archive}.spdx.json#${archiveSha}`,
+            creationInfo: {
+              created,
+              creators: [`Tool: litert-lm-rust-release-${version}`, `Organization: ${repoSlug.split("/")[0]}`],
+              comment: `Built on Limrun 96-vCPU Linux sandbox from ${repoSlug}@${commitSha} and google-ai-edge/LiteRT-LM@${upstreamRef}`,
+            },
+            packages,
+            relationships,
+          };
+
+          fs.writeFileSync(`dist/litert-lm-${tag}-${target}.spdx.json`, JSON.stringify(sbom, null, 2) + "\n");
+          NODE
+
+          ls -lh dist/
+
+      - name: Upload staged release bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-x86_64-unknown-linux-gnu
+          path: dist/*
+          if-no-files-found: error
+
+      - name: Delete ephemeral Limrun sandbox
+        if: always() && steps.sandbox.outputs.id != ''
+        env:
+          LIM_API_KEY: ${{ secrets.LIM_API_KEY }}
+        run: |
+          lim gradle delete "${{ steps.sandbox.outputs.id }}" || true
+
+  attest-and-release:
+    needs: build-linux-x86_64
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.build-linux-x86_64.outputs.commit_sha }}
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Download staged release bundle
+        uses: actions/download-artifact@v4
+        with:
+          name: release-x86_64-unknown-linux-gnu
+          path: dist
+
+      - name: Verify SHA-256 checksums before signing
+        run: |
+          set -euo pipefail
+          (cd dist && sha256sum -c SHA256SUMS.txt)
+
+      - name: Attest SLSA build provenance (archive and shared libraries)
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            dist/*.tar.gz
+            dist/*.so
+
+      - name: Attest SPDX 2.3 SBOM
+        uses: actions/attest-sbom@v2
+        with:
+          subject-path: dist/litert-lm-${{ needs.build-linux-x86_64.outputs.tag }}-x86_64-unknown-linux-gnu.tar.gz
+          sbom-path: dist/litert-lm-${{ needs.build-linux-x86_64.outputs.tag }}-x86_64-unknown-linux-gnu.spdx.json
+
+      - name: Generate release notes with verification guide
+        run: |
+          set -euo pipefail
+          TAG="${{ needs.build-linux-x86_64.outputs.tag }}"
+          VERSION="${{ needs.build-linux-x86_64.outputs.version }}"
+          UPSTREAM_REF="${{ needs.build-linux-x86_64.outputs.upstream_ref }}"
+          ARCHIVE="litert-lm-${TAG}-x86_64-unknown-linux-gnu.tar.gz"
+          cat > release-notes.md <<EOF
+          Prebuilt portable **LiteRT-LM C API v1.1.0** native shared libraries for \`litert-lm-rust\` \`${VERSION}\` (\`x86_64-unknown-linux-gnu\`, \`glibc >= 2.36\`, static \`libstdc++\`, \`\$ORIGIN\` \`RUNPATH\`), built on a 96-vCPU Limrun sandbox from [\`google-ai-edge/LiteRT-LM@${UPSTREAM_REF:0:12}\`](https://github.com/google-ai-edge/LiteRT-LM/commit/${UPSTREAM_REF}) and attested with GitHub Sigstore OIDC SLSA build provenance + SPDX 2.3 SBOM.
+
+          ### Cargo (automatic verified download)
+
+          \`\`\`toml
+          [dependencies]
+          litert-lm-rust = { git = "https://github.com/${GITHUB_REPOSITORY}", tag = "${TAG}" }
+          \`\`\`
+
+          \`build.rs\` (\`download-native\` enabled by default) automatically downloads \`liblitert-lm.so\`, \`libGemmaModelConstraintProvider.so\`, and \`libwebgpu_dawn.so\` from this release and verifies each file's \`.sha256\` digest before linking.
+
+          ### Standalone Download & Verification
+
+          \`\`\`bash
+          # 1. Download archive + checksums
+          curl -fsSLO "https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/${ARCHIVE}"
+          curl -fsSLO "https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/${ARCHIVE}.sha256"
+
+          # 2. Verify SHA-256 checksum
+          sha256sum -c "${ARCHIVE}.sha256"
+
+          # 3. Verify cryptographic SLSA v1.0 build provenance & SPDX 2.3 SBOM
+          gh attestation verify "${ARCHIVE}" --repo ${GITHUB_REPOSITORY}
+          gh attestation verify "${ARCHIVE}" --repo ${GITHUB_REPOSITORY} --predicate-type https://spdx.dev/Document
+          \`\`\`
+
+          ### SHA-256 Checksums
+
+          \`\`\`text
+          $(cat dist/SHA256SUMS.txt)
+          \`\`\`
+          EOF
+
+      - name: Publish GitHub Release with binaries, checksums, and SBOM
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.build-linux-x86_64.outputs.tag }}
+          target_commitish: ${{ needs.build-linux-x86_64.outputs.commit_sha }}
+          name: litert-lm-rust ${{ needs.build-linux-x86_64.outputs.tag }}
+          body_path: release-notes.md
+          draft: false
+          prerelease: false
+          make_latest: true
+          files: dist/*
+
+      - name: Verify live GitHub Release, Sigstore attestations, and Cargo download
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="${{ needs.build-linux-x86_64.outputs.tag }}"
+          ARCHIVE="litert-lm-${TAG}-x86_64-unknown-linux-gnu.tar.gz"
+
+          mkdir -p /tmp/release-dl
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir /tmp/release-dl
+          (cd /tmp/release-dl && sha256sum -c SHA256SUMS.txt)
+
+          for f in "/tmp/release-dl/${ARCHIVE}" \
+                   /tmp/release-dl/liblitert-lm.so \
+                   /tmp/release-dl/libGemmaModelConstraintProvider.so \
+                   /tmp/release-dl/libwebgpu_dawn.so; do
+            gh attestation verify "$f" --repo "$GITHUB_REPOSITORY"
+          done
+          gh attestation verify "/tmp/release-dl/${ARCHIVE}" --repo "$GITHUB_REPOSITORY" --predicate-type https://spdx.dev/Document
+
+          echo "=== Verify fresh Cargo download-native build against public GitHub Release URL ==="
+          env -u LITERT_LM_LIB_DIR -u LD_LIBRARY_PATH \
+            LITERT_LM_FORCE_DOWNLOAD=1 \
+            LITERT_LM_RELEASE_URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}" \
+            CARGO_TARGET_DIR=/tmp/cargo-public-e2e \
+            cargo test

@@ -145,6 +145,8 @@ jobs:
             } >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
+          printf '%s\n' "${UPSTREAM_SHA}" > c/UPSTREAM_COMMIT
+          git add c/UPSTREAM_COMMIT
           git commit -m "chore(bindings): auto-sync with upstream LiteRT-LM (${UPSTREAM_SHA})"
           git pull --rebase origin master
           git push origin master

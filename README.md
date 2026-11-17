@@ -18,10 +18,10 @@ This crate wraps the stable **C API** (`c/engine.h` + `c/conversation.h`), which
 
 ```toml
 [dependencies]
-litert-lm-rust = "0.3.0"
+litert-lm-rust = { git = "https://github.com/maceip/litert-lm-rust", tag = "v0.3.0" }
 ```
 
-The crate will automatically download the required native libraries from GitHub releases on first build (Windows only). No manual setup is required for most use cases.
+On `x86_64-unknown-linux-gnu`, `build.rs` (`download-native` enabled by default) automatically downloads the portable LiteRT-LM shared libraries from [GitHub Releases](https://github.com/maceip/litert-lm-rust/releases) (`glibc >= 2.36`, static `libstdc++`, `$ORIGIN` `RUNPATH`) and verifies each file's SHA-256 checksum before linking.
 
 ## Quick start
 
@@ -68,33 +68,42 @@ let engine = Engine::builder("model.litertlm")
 
 ## Native library
 
-### Automatic Download (Windows - Recommended)
+### Automatic Verified Download (`download-native`, Default)
 
-The crate includes a `download-native` feature (enabled by default) that automatically downloads the required native libraries from GitHub releases on first build. The native libraries are built from the LiteRT-LM source using a GitHub Actions workflow and published as release assets.
+The `download-native` feature (enabled by default) downloads prebuilt native libraries from `https://github.com/maceip/litert-lm-rust/releases/download/v<version>` (overridable via `LITERT_LM_RELEASE_URL`) into `<OUT_DIR>/prebuilt/` when no local library is found, verifying every file against its `.sha256` sidecar before linking.
 
-**Downloaded files:**
-- `litert-lm.dll` - Main LiteRT-LM library.
-- `litert-lm.if.lib` - Import library for linking
-- `libLiteRt.dll` - LiteRT runtime library
-- `libGemmaModelConstraintProvider.dll` - Gemma constraint provider
-- `libLiteRtTopKWebGpuSampler.dll` - WebGPU sampler
-- `libLiteRtWebGpuAccelerator.dll` - WebGPU accelerator
-- `libwebgpu_dawn.dll` - Dawn WebGPU implementation
+Native Linux releases are built from pinned upstream `google-ai-edge/LiteRT-LM` (`c/UPSTREAM_COMMIT`) on a 96-vCPU Limrun sandbox via `.github/workflows/release-native.yml` and signed with GitHub Sigstore OIDC **SLSA v1.0 build provenance** and an attested **SPDX 2.3 SBOM**.
 
-These libraries are automatically downloaded to the crate's `prebuilt/` directory during the first build. No manual setup is required.
+**Linux (`x86_64-unknown-linux-gnu`) release assets:**
+- `litert-lm-v0.3.0-x86_64-unknown-linux-gnu.tar.gz` (+ `.sha256` and `.spdx.json`) — complete portable archive
+- `liblitert-lm.so` (+ `.sha256`) — main LiteRT-LM C API v1.1.0 shared library
+- `libGemmaModelConstraintProvider.so` (+ `.sha256`) — Gemma structured/constrained decoding provider
+- `libwebgpu_dawn.so` (+ `.sha256`) — Dawn WebGPU runtime
+- `SHA256SUMS.txt` — combined SHA-256 manifest
+
+**Verifying release authenticity manually:**
+
+```bash
+curl -fsSLO https://github.com/maceip/litert-lm-rust/releases/download/v0.3.0/litert-lm-v0.3.0-x86_64-unknown-linux-gnu.tar.gz
+curl -fsSLO https://github.com/maceip/litert-lm-rust/releases/download/v0.3.0/litert-lm-v0.3.0-x86_64-unknown-linux-gnu.tar.gz.sha256
+
+sha256sum -c litert-lm-v0.3.0-x86_64-unknown-linux-gnu.tar.gz.sha256
+gh attestation verify litert-lm-v0.3.0-x86_64-unknown-linux-gnu.tar.gz --repo maceip/litert-lm-rust
+gh attestation verify litert-lm-v0.3.0-x86_64-unknown-linux-gnu.tar.gz --repo maceip/litert-lm-rust --predicate-type https://spdx.dev/Document
+```
 
 ### Using in another project
 
-If you use this crate as a **path dependency** in another workspace, copy the DLLs and `.if.lib` from the `prebuilt/` folder into your local copy of the crate. The `build.rs` looks for them in these directories (in order):
+`build.rs` searches for native libraries in the following order (skipping network download whenever a local copy is present):
 
-1. The `LITERT_LM_LIB_DIR` environment variable
-2. `<build_out>/prebuilt/` (auto-downloaded location)
-3. `<crate_dir>/prebuilt/` — **easiest: just copy files here**
-4. `<crate_dir>/native/`
-5. `<crate_dir>/c/`
-6. `<crate_dir>/c/build/`
+1. `LITERT_LM_LIB_DIR` environment variable
+2. `<OUT_DIR>/prebuilt/` (auto-downloaded location when `download-native` is enabled)
+3. `<crate_dir>/prebuilt/`
+4. `<crate_dir>/prebuilt/macos/`
+5. `<crate_dir>/native/`
+6. `<crate_dir>/c/` and `<crate_dir>/c/build/`
 
-At runtime the DLLs must also be on `PATH` or next to the executable.
+On Linux and macOS, `build.rs` embeds `-Wl,-rpath,<dir>` and `liblitert-lm.so` carries `RUNPATH=$ORIGIN`, so executables resolve companion libraries without setting `LD_LIBRARY_PATH`. On Windows, runtime DLLs must be on `PATH` or next to the executable.
 
 ### Manual Setup
 
