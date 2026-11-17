@@ -1,0 +1,75 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  linux-x86_64:
+    name: Linux x86_64 (Cargo + SLSA Release Verification)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo registry and build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Verify published release SLSA provenance and SPDX 2.3 SBOM
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          VERSION="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n1)"
+          TAG="v${VERSION}"
+          ARCHIVE="litert-lm-${TAG}-x86_64-unknown-linux-gnu.tar.gz"
+          TMP_DL="$(mktemp -d)"
+          trap 'rm -rf "$TMP_DL"' EXIT
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir "$TMP_DL" \
+            -p "$ARCHIVE" -p "SHA256SUMS.txt"
+          (cd "$TMP_DL" && grep "$ARCHIVE" SHA256SUMS.txt | sha256sum -c -)
+          gh attestation verify "$TMP_DL/$ARCHIVE" --repo "$GITHUB_REPOSITORY"
+          gh attestation verify "$TMP_DL/$ARCHIVE" --repo "$GITHUB_REPOSITORY" \
+            --predicate-type https://spdx.dev/Document/v2.3
+
+      - name: Build and test via SHA-256-verified download-native (no LD_LIBRARY_PATH)
+        run: |
+          set -euo pipefail
+          unset LD_LIBRARY_PATH LITERT_LM_LIB_DIR
+          cargo test
+          cargo build --examples
+          # Invoke example binary without a model to verify dynamic linker resolves
+          # liblitert-lm.so + companion .so files via embedded rpath and $ORIGIN RUNPATH.
+          set +e
+          OUT="$(./target/debug/examples/text_chat 2>&1)"
+          RC=$?
+          set -e
+          echo "$OUT"
+          if echo "$OUT" | grep -qi "error while loading shared libraries"; then
+            echo "::error::Dynamic linker failed to resolve shared libraries"
+            exit 1
+          fi
+          test "$RC" -ne 127
+
+      - name: Verify docs-only, bindgen, shell scripts, and crate package manifest
+        run: |
+          set -euo pipefail
+          if ! ldconfig -p | grep -q libclang && ! compgen -G "/usr/lib/llvm-*/lib/libclang.so*" >/dev/null; then
+            sudo apt-get update && sudo apt-get install -y --no-install-recommends clang libclang-dev
+          fi
+          bash -n scripts/limrun-build.sh scripts/fetch-clef-model.sh
+          cargo check --no-default-features --features docs-only
+          cargo check --no-default-features --features bindgen,docs-only
+          cargo package --list >/dev/null
