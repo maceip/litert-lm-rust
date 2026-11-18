@@ -716,7 +716,9 @@ jobs:
         with:
           key: windows-x86_64
 
-      - uses: actions/cache@v4
+      - name: Restore Bazel repository cache
+        id: bazel_repo_cache
+        uses: actions/cache/restore@v4
         with:
           path: ~/bazel-repo-cache
           key: bazel-repo-windows-${{ needs.meta.outputs.upstream_ref }}
@@ -730,7 +732,7 @@ jobs:
         with:
           arch: x64
 
-      - name: "Configure Windows Long Paths, Developer Mode symlinks, MSYS2 tools, and short workspace"
+      - name: "Configure Windows Long Paths, Developer Mode symlinks, MSYS2 bash, and short workspace"
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -739,6 +741,29 @@ jobs:
           Set-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock' -Name 'AllowDevelopmentWithoutDevLicense' -Value 1 -Type DWord
           git config --system core.longpaths true
           git lfs install
+
+          # Win32 CreateProcessW(NULL, "bash -c ...") in Bazel's JVM searches C:\Windows\System32
+          # BEFORE PATH. Remove the inactive WSL launcher stub so Bazel repository rules resolve
+          # Git for Windows MSYS2 bash + GNU sed/patch/grep.
+          foreach ($stub in @(
+            "$env:SystemRoot\System32\bash.exe",
+            "$env:SystemRoot\SysWOW64\bash.exe",
+            "$env:LOCALAPPDATA\Microsoft\WindowsApps\bash.exe",
+            "$env:LOCALAPPDATA\Microsoft\WindowsApps\python3.exe"
+          )) {
+            if (Test-Path $stub) {
+              & takeown.exe /F $stub /A | Out-Null
+              & icacls.exe $stub /grant "*S-1-5-32-544:F" | Out-Null
+              Remove-Item -Force $stub
+              Write-Host "Removed stub: $stub"
+            }
+          }
+
+          $pyExe = (Get-Command python.exe).Source
+          $py3Exe = Join-Path (Split-Path $pyExe -Parent) "python3.exe"
+          if (-not (Test-Path $py3Exe)) {
+            Copy-Item $pyExe $py3Exe -Force
+          }
 
           Add-Content -Path $env:GITHUB_PATH -Value "$env:ALLUSERSPROFILE\chocolatey\bin"
           Add-Content -Path $env:GITHUB_PATH -Value "C:\Program Files\Git\cmd"
@@ -837,16 +862,11 @@ jobs:
           $shortRef = $upstreamRef.Substring(0, 12)
           $repoCache = "$HOME\bazel-repo-cache" -replace '\\', '/'
 
-          # Prepend Git MSYS2 tools ahead of C:\Windows\System32\bash.exe (WSL stub)
           $gitTools = "C:\Program Files\Git\usr\bin;C:\Program Files\Git\bin;C:\Program Files\Git\mingw64\bin;C:\Program Files\Git\cmd"
           $env:PATH = "$gitTools;$env:PATH"
-          $bashExe = (Get-Command bash.exe).Source
-          Write-Host "Using bash.exe: $bashExe"
-          if ($bashExe -like "*System32*") {
-            throw "bash.exe resolved to WSL stub ($bashExe) instead of Git MSYS2 bash"
-          }
-          & bash.exe -c "which bash sed patch grep tr awk && sed --version | head -n 1"
-          if ($LASTEXITCODE -ne 0) { throw "MSYS2 POSIX tool check failed" }
+          # Verify Win32 CreateProcessW(NULL, "bash -c ...") directly (same search order as Bazel JVM)
+          python -c "import subprocess, sys; r = subprocess.run(['bash', '-c', 'which bash sed patch grep tr awk && sed --version | head -n 1'], capture_output=True, text=True); print(r.stdout); sys.stderr.write(r.stderr); sys.exit(r.returncode)"
+          if ($LASTEXITCODE -ne 0) { throw "Win32 CreateProcessW('bash') POSIX tool check failed" }
 
           $cacheFlags = @()
           if ($env:LIM_API_KEY) {
@@ -934,6 +954,13 @@ jobs:
             lim asset push "$w\pulled\$assetName" -n $assetName | Out-Null
             lim asset push "$w\pulled\$shaAssetName" -n $shaAssetName | Out-Null
           }
+
+      - name: Save Bazel repository cache
+        if: always() && steps.cache_check.outputs.hit != 'true' && steps.bazel_repo_cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/bazel-repo-cache
+          key: bazel-repo-windows-${{ needs.meta.outputs.upstream_ref }}
 
       - name: Verify PE DLL exports, Cargo test suite, and zero-PATH DLL loading
         shell: pwsh
