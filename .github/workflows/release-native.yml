@@ -897,6 +897,8 @@ jobs:
           Remove-Item Env:GIT_LFS_SKIP_SMUDGE -ErrorAction SilentlyContinue
           git -C "$w\s" lfs pull --include="prebuilt/windows_x86_64/*"
           if ($LASTEXITCODE -ne 0) { throw "git lfs pull failed" }
+          python scripts\win-helper.py patch-upstream "$w\s"
+          if ($LASTEXITCODE -ne 0) { throw "patch-upstream failed" }
 
           Push-Location "$w\s"
           try {

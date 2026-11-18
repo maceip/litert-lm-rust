@@ -81,10 +81,48 @@ def verify_exports(bindings_rs: str, dll_path: str) -> None:
         sys.exit(f"Missing C API functions: {missing}")
 
 
+def patch_upstream(src_root: str) -> None:
+    """Fix upstream c/engine.cc #if inside LITERT_LM_C_ASSIGN_OR_RETURN macro for MSVC /Zc:preprocessor."""
+    engine_cc = pathlib.Path(src_root) / "c" / "engine.cc"
+    text = engine_cc.read_text(encoding="utf-8")
+    old = """  LITERT_LM_C_ASSIGN_OR_RETURN(
+      ModelAssets model_assets,
+      ModelAssets::Create(
+#if defined(_WIN32)
+          std::make_shared<litert::lm::ScopedFile>(litert::lm::ScopedFile(
+              reinterpret_cast<litert::lm::ScopedFile::PlatformFile>(
+                  _get_osfhandle(fd))))));
+#else
+          std::make_shared<litert::lm::ScopedFile>(
+              litert::lm::ScopedFile(fd))));
+#endif"""
+    new = """#if defined(_WIN32)
+  auto scoped_file =
+      std::make_shared<litert::lm::ScopedFile>(litert::lm::ScopedFile(
+          reinterpret_cast<litert::lm::ScopedFile::PlatformFile>(
+              _get_osfhandle(fd))));
+#else
+  auto scoped_file = std::make_shared<litert::lm::ScopedFile>(
+      litert::lm::ScopedFile(fd));
+#endif
+  LITERT_LM_C_ASSIGN_OR_RETURN(
+      ModelAssets model_assets,
+      ModelAssets::Create(std::move(scoped_file)));"""
+    if old in text:
+        engine_cc.write_text(text.replace(old, new, 1), encoding="utf-8", newline="\n")
+        print(f"Patched MSVC preprocessor macro directive in {engine_cc}")
+    elif new in text:
+        print(f"Already patched: {engine_cc}")
+    else:
+        sys.exit(f"ExpectedLITERT_LM_C_ASSIGN_OR_RETURN snippet not found in {engine_cc}")
+
+
 def main() -> None:
     cmd = sys.argv[1]
     if cmd == "write-manifest":
         write_manifest(sys.argv[2])
+    elif cmd == "patch-upstream":
+        patch_upstream(sys.argv[2])
     elif cmd == "stage-built-dll":
         stage_built_dll(sys.argv[2], sys.argv[3])
     elif cmd == "make-import-lib":
