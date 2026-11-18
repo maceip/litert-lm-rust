@@ -16,13 +16,14 @@ on:
         required: false
         default: ''
         type: string
+      force_rebuild:
+        description: 'Force clean C++ rebuild instead of reusing verified Limrun Asset Storage archive'
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
-
-concurrency:
-  group: release-native-${{ github.ref }}
-  cancel-in-progress: false
 
 jobs:
   meta:
@@ -33,6 +34,7 @@ jobs:
       version: ${{ steps.resolve.outputs.version }}
       upstream_ref: ${{ steps.resolve.outputs.upstream_ref }}
       commit_sha: ${{ steps.resolve.outputs.commit_sha }}
+      force_rebuild: ${{ steps.resolve.outputs.force_rebuild }}
     steps:
       - uses: actions/checkout@v4
 
@@ -41,6 +43,7 @@ jobs:
         env:
           INPUT_TAG: ${{ inputs.tag }}
           INPUT_UPSTREAM_REF: ${{ inputs.upstream_ref }}
+          INPUT_FORCE_REBUILD: ${{ inputs.force_rebuild }}
         run: |
           set -euo pipefail
           CARGO_VER="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n1)"
@@ -57,14 +60,16 @@ jobs:
           else
             UPSTREAM_REF="$(tr -d ' \n\r' < c/UPSTREAM_COMMIT)"
           fi
+          FORCE_REBUILD="${INPUT_FORCE_REBUILD:-false}"
           COMMIT_SHA="$(git rev-parse HEAD)"
           {
             echo "version=${VERSION}"
             echo "tag=${TAG}"
             echo "upstream_ref=${UPSTREAM_REF}"
             echo "commit_sha=${COMMIT_SHA}"
+            echo "force_rebuild=${FORCE_REBUILD}"
           } >> "$GITHUB_OUTPUT"
-          echo "Resolved release tag=${TAG}, version=${VERSION}, upstream=${UPSTREAM_REF}"
+          echo "Resolved release tag=${TAG}, version=${VERSION}, upstream=${UPSTREAM_REF}, force_rebuild=${FORCE_REBUILD}"
 
   build-linux-x86_64:
     needs: meta
@@ -98,8 +103,45 @@ jobs:
           lim set-api-key "$LIM_API_KEY" >/dev/null
           lim version
 
+      - name: Check Limrun Asset Storage for cached Linux archive
+        id: cache_check
+        run: |
+          set -euo pipefail
+          UPSTREAM_REF="${{ needs.meta.outputs.upstream_ref }}"
+          SHORT_REF="${UPSTREAM_REF:0:12}"
+          FORCE_REBUILD="${{ needs.meta.outputs.force_rebuild }}"
+          ASSET_NAME="litert-lm-linux-x86_64-${SHORT_REF}.tar.gz"
+          SHA_ASSET_NAME="${ASSET_NAME}.sha256"
+          mkdir -p /tmp/pulled
+          HIT="false"
+          if [[ "$FORCE_REBUILD" != "true" ]]; then
+            ASSET_ID="$(lim asset list --name "$ASSET_NAME" --json 2>/dev/null | node -e '
+              const items = JSON.parse(require("fs").readFileSync(0, "utf8") || "[]");
+              process.stdout.write(items[0]?.id || "");
+            ' || true)"
+            if [[ -n "$ASSET_ID" ]] && lim asset pull "$ASSET_ID" -o /tmp/pulled >/dev/null; then
+              SHA_ID="$(lim asset list --name "$SHA_ASSET_NAME" --json 2>/dev/null | node -e '
+                const items = JSON.parse(require("fs").readFileSync(0, "utf8") || "[]");
+                process.stdout.write(items[0]?.id || "");
+              ' || true)"
+              VALID=1
+              if [[ -n "$SHA_ID" ]] && lim asset pull "$SHA_ID" -o /tmp/pulled >/dev/null 2>&1; then
+                EXPECTED="$(awk '{print tolower($1)}' "/tmp/pulled/$SHA_ASSET_NAME")"
+                ACTUAL="$(sha256sum "/tmp/pulled/$ASSET_NAME" | awk '{print $1}')"
+                [[ "$EXPECTED" == "$ACTUAL" ]] || VALID=0
+              fi
+              if [[ "$VALID" -eq 1 ]]; then
+                cp -f "/tmp/pulled/$ASSET_NAME" /tmp/pulled/litert-lm-out.tar.gz
+                HIT="true"
+                echo "Restored verified Linux archive from Limrun Asset Storage ($ASSET_NAME, $ASSET_ID)"
+              fi
+            fi
+          fi
+          echo "hit=${HIT}" >> "$GITHUB_OUTPUT"
+
       - name: Create ephemeral 96-vCPU Limrun Linux sandbox
         id: sandbox
+        if: steps.cache_check.outputs.hit != 'true'
         run: |
           set -euo pipefail
           TAG="${{ needs.meta.outputs.tag }}"
@@ -107,12 +149,13 @@ jobs:
           SHORT_REF="${UPSTREAM_REF:0:8}"
           mkdir -p /tmp/lim-ws
           printf 'rootProject.name = "litert-lm-ci"\n' > /tmp/lim-ws/settings.gradle
-          SANDBOX_JSON="$(lim gradle create --display-name "litert-lm-${TAG}-${SHORT_REF}" --inactivity-timeout 30m --hard-timeout 60m --label "repo=litert-lm-rust" --json)"
+          SANDBOX_JSON="$(lim gradle create --display-name "litert-lm-${TAG}-${SHORT_REF}" --inactivity-timeout 30m --hard-timeout 90m --label "repo=litert-lm-rust" --json)"
           SANDBOX_ID="$(node -e 'process.stdout.write(JSON.parse(require("fs").readFileSync(0, "utf8")).metadata.id)' <<<"$SANDBOX_JSON")"
           echo "id=${SANDBOX_ID}" >> "$GITHUB_OUTPUT"
           env -C /tmp/lim-ws lim gradle sync --id "$SANDBOX_ID" >/dev/null
 
       - name: Build portable LiteRT-LM C API shared libraries on Limrun
+        if: steps.cache_check.outputs.hit != 'true'
         run: |
           set -euo pipefail
           SANDBOX_ID="${{ steps.sandbox.outputs.id }}"
@@ -122,18 +165,21 @@ jobs:
           SHORT_REF="${UPSTREAM_REF:0:12}"
           UPSTREAM_REPO="https://github.com/google-ai-edge/LiteRT-LM.git"
 
-          CACHE_TOKEN="$(lim access-token create --permission 'remotecache:*:all' --permission 'remoteexecution:*:all' --ttl-seconds 3600 --quiet || true)"
+          CACHE_TOKEN="$(lim access-token create --permission 'remotecache:*:all' --permission 'remoteexecution:*:all' --ttl-seconds 7200 --quiet || true)"
           SETUP_JSON="$(node -e '
-            const path = require("path"), fs = require("fs"), cp = require("child_process");
-            const limBin = fs.realpathSync(cp.execFileSync("which", ["lim"], { encoding: "utf8" }).trim());
-            const limRoot = path.resolve(path.dirname(limBin), "..");
-            const Limrun = require(path.join(limRoot, "node_modules/@limrun/api")).default;
-            const { readConfig } = require(path.join(limRoot, "dist/lib/config"));
-            const { getBazelSetup } = require(path.join(limRoot, "dist/lib/bazel-setup"));
-            const cfg = readConfig();
-            const client = new Limrun({ apiKey: cfg.apiKey, baseURL: cfg.apiEndpoint });
-            getBazelSetup(client).then(j => process.stdout.write(JSON.stringify(j))).catch(() => process.stdout.write("{}"));
-          ' || echo '{}')"
+            try {
+              const path = require("path"), cp = require("child_process");
+              const limRoot = path.join(cp.execSync("npm root -g", { encoding: "utf8" }).trim(), "lim");
+              const Limrun = require(path.join(limRoot, "node_modules/@limrun/api")).default;
+              const { readConfig } = require(path.join(limRoot, "dist/lib/config"));
+              const { getBazelSetup } = require(path.join(limRoot, "dist/lib/bazel-setup"));
+              const cfg = readConfig();
+              const client = new Limrun({ apiKey: cfg.apiKey, baseURL: cfg.apiEndpoint });
+              getBazelSetup(client).then(j => process.stdout.write(JSON.stringify(j))).catch(() => process.stdout.write("{}"));
+            } catch {
+              process.stdout.write("{}");
+            }
+          ')"
           RBE_ENDPOINT="$(node -e 'process.stdout.write(JSON.parse(require("fs").readFileSync(0, "utf8")).endpoint || "")' <<<"$SETUP_JSON")"
           RBE_INSTANCE="$(node -e 'process.stdout.write(JSON.parse(require("fs").readFileSync(0, "utf8")).instanceName || "")' <<<"$SETUP_JSON")"
 
@@ -196,53 +242,43 @@ jobs:
               ar rcs /tmp/static-cxx/libstdc++.so /tmp/litert_glibc_compat.o
             '
 
-          BUILT_OK=0
-          for attempt in 1 2 3 4 5; do
-            if env -C /tmp/lim-ws lim gradle run \
-              --id "$SANDBOX_ID" \
-              --no-sync \
-              --timeout 360 \
-              --env "LIM_CACHE_TOKEN=$CACHE_TOKEN" \
-              --env "RBE_ENDPOINT=$RBE_ENDPOINT" \
-              --env "RBE_INSTANCE=$RBE_INSTANCE" \
-              -- bash -ce '
-                export PATH="$HOME/.local/bin:$PATH"
-                CACHE_FLAGS=()
-                if [ -n "${RBE_ENDPOINT:-}" ] && [ -n "${LIM_CACHE_TOKEN:-}" ]; then
-                  CACHE_FLAGS=(
-                    --remote_cache="$RBE_ENDPOINT"
-                    --remote_instance_name="$RBE_INSTANCE"
-                    --remote_header="Authorization=Bearer $LIM_CACHE_TOKEN"
-                    --remote_upload_local_results=true
-                    --remote_cache_compression
-                    --remote_local_fallback=true
-                  )
-                fi
-                timeout 300 env -C /tmp/LiteRT-LM bazelisk --output_user_root=/tmp/bazel-litert build \
-                  "${CACHE_FLAGS[@]}" \
-                  --repo_env=GIT_LFS_SKIP_SMUDGE=1 \
-                  --config=linux_x86_64 \
-                  --cxxopt=-std=c++20 \
-                  --host_cxxopt=-std=c++20 \
-                  --java_runtime_version=remotejdk_17 \
-                  --linkopt=/tmp/litert_glibc_compat.o \
-                  --linkopt=-L/tmp/static-cxx \
-                  --linkopt=-Wl,--exclude-libs,libstdc++.so:libstdc++.a \
-                  --linkopt=-Wl,--defsym=pidfd_spawnp=0 \
-                  --linkopt=-Wl,--defsym=pidfd_getpid=0 \
-                  --linkopt='\''-Wl,-rpath,$ORIGIN'\'' \
-                  --jobs=96 \
-                  //c:litert-lm
-              ' ; then
-              BUILT_OK=1
-              break
-            fi
-            echo "Continuing incremental Bazel build pass (${attempt}/5)..."
-          done
-          if [[ "$BUILT_OK" -ne 1 ]]; then
-            echo "::error::Bazel build of //c:litert-lm did not complete within 5 passes."
-            exit 1
-          fi
+          env -C /tmp/lim-ws lim gradle run \
+            --id "$SANDBOX_ID" \
+            --no-sync \
+            --timeout 4800 \
+            --env "LIM_CACHE_TOKEN=$CACHE_TOKEN" \
+            --env "RBE_ENDPOINT=$RBE_ENDPOINT" \
+            --env "RBE_INSTANCE=$RBE_INSTANCE" \
+            -- bash -ce '
+              export PATH="$HOME/.local/bin:$PATH"
+              CACHE_FLAGS=()
+              if [ -n "${RBE_ENDPOINT:-}" ] && [ -n "${LIM_CACHE_TOKEN:-}" ]; then
+                CACHE_FLAGS=(
+                  --remote_cache="$RBE_ENDPOINT"
+                  --remote_instance_name="$RBE_INSTANCE"
+                  --remote_header="Authorization=Bearer $LIM_CACHE_TOKEN"
+                  --remote_upload_local_results=true
+                  --remote_cache_compression
+                  --remote_download_all
+                  --remote_local_fallback=true
+                )
+              fi
+              env -C /tmp/LiteRT-LM bazelisk --output_user_root=/tmp/bazel-litert build \
+                "${CACHE_FLAGS[@]}" \
+                --repo_env=GIT_LFS_SKIP_SMUDGE=1 \
+                --config=linux_x86_64 \
+                --cxxopt=-std=c++20 \
+                --host_cxxopt=-std=c++20 \
+                --java_runtime_version=remotejdk_17 \
+                --linkopt=/tmp/litert_glibc_compat.o \
+                --linkopt=-L/tmp/static-cxx \
+                --linkopt=-Wl,--exclude-libs,libstdc++.so:libstdc++.a \
+                --linkopt=-Wl,--defsym=pidfd_spawnp=0 \
+                --linkopt=-Wl,--defsym=pidfd_getpid=0 \
+                --linkopt='\''-Wl,-rpath,$ORIGIN'\'' \
+                --jobs=auto \
+                //c:litert-lm
+            '
 
           env -C /tmp/lim-ws lim gradle run \
             --id "$SANDBOX_ID" \
@@ -394,12 +430,19 @@ jobs:
         with:
           key: macos-arm64
 
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/bazel-repo
+          key: bazel-repo-macos-${{ needs.meta.outputs.upstream_ref }}
+          restore-keys: |
+            bazel-repo-macos-
+
       - name: Install Bazelisk and Limrun CLI
         env:
           LIM_API_KEY: ${{ secrets.LIM_API_KEY }}
         run: |
           set -euo pipefail
-          mkdir -p "$HOME/.local/bin"
+          mkdir -p "$HOME/.local/bin" "$HOME/.cache/bazel-repo"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           curl -fsSL https://github.com/bazelbuild/bazelisk/releases/download/v1.25.0/bazelisk-darwin-arm64 -o "$HOME/.local/bin/bazelisk"
           chmod +x "$HOME/.local/bin/bazelisk"
@@ -411,7 +454,46 @@ jobs:
           fi
           git lfs install
 
+      - name: Check Limrun Asset Storage for cached macOS archive
+        id: cache_check
+        env:
+          LIM_API_KEY: ${{ secrets.LIM_API_KEY }}
+        run: |
+          set -euo pipefail
+          UPSTREAM_REF="${{ needs.meta.outputs.upstream_ref }}"
+          SHORT_REF="${UPSTREAM_REF:0:12}"
+          FORCE_REBUILD="${{ needs.meta.outputs.force_rebuild }}"
+          ASSET_NAME="litert-lm-macos-arm64-${SHORT_REF}.tar.gz"
+          SHA_ASSET_NAME="${ASSET_NAME}.sha256"
+          mkdir -p /tmp/pulled
+          HIT="false"
+          if [[ "$FORCE_REBUILD" != "true" && -n "${LIM_API_KEY:-}" ]]; then
+            ASSET_ID="$(lim asset list --name "$ASSET_NAME" --json 2>/dev/null | node -e '
+              const items = JSON.parse(require("fs").readFileSync(0, "utf8") || "[]");
+              process.stdout.write(items[0]?.id || "");
+            ' || true)"
+            if [[ -n "$ASSET_ID" ]] && lim asset pull "$ASSET_ID" -o /tmp/pulled >/dev/null; then
+              SHA_ID="$(lim asset list --name "$SHA_ASSET_NAME" --json 2>/dev/null | node -e '
+                const items = JSON.parse(require("fs").readFileSync(0, "utf8") || "[]");
+                process.stdout.write(items[0]?.id || "");
+              ' || true)"
+              VALID=1
+              if [[ -n "$SHA_ID" ]] && lim asset pull "$SHA_ID" -o /tmp/pulled >/dev/null 2>&1; then
+                EXPECTED="$(awk '{print tolower($1)}' "/tmp/pulled/$SHA_ASSET_NAME")"
+                ACTUAL="$(shasum -a 256 "/tmp/pulled/$ASSET_NAME" | awk '{print $1}')"
+                [[ "$EXPECTED" == "$ACTUAL" ]] || VALID=0
+              fi
+              if [[ "$VALID" -eq 1 ]]; then
+                cp -f "/tmp/pulled/$ASSET_NAME" /tmp/pulled/litert-lm-out.tar.gz
+                HIT="true"
+                echo "Restored verified macOS archive from Limrun Asset Storage ($ASSET_NAME, $ASSET_ID)"
+              fi
+            fi
+          fi
+          echo "hit=${HIT}" >> "$GITHUB_OUTPUT"
+
       - name: Build macOS arm64 LiteRT-LM C API shared libraries (with Limrun RBE cache)
+        if: steps.cache_check.outputs.hit != 'true'
         env:
           LIM_API_KEY: ${{ secrets.LIM_API_KEY }}
         run: |
@@ -425,16 +507,19 @@ jobs:
           if [[ -n "${LIM_API_KEY:-}" ]]; then
             CACHE_TOKEN="$(lim access-token create --permission 'remotecache:*:all' --permission 'remoteexecution:*:all' --ttl-seconds 7200 --quiet || true)"
             SETUP_JSON="$(node -e '
-              const path = require("path"), fs = require("fs"), cp = require("child_process");
-              const limBin = fs.realpathSync(cp.execFileSync("which", ["lim"], { encoding: "utf8" }).trim());
-              const limRoot = path.resolve(path.dirname(limBin), "..");
-              const Limrun = require(path.join(limRoot, "node_modules/@limrun/api")).default;
-              const { readConfig } = require(path.join(limRoot, "dist/lib/config"));
-              const { getBazelSetup } = require(path.join(limRoot, "dist/lib/bazel-setup"));
-              const cfg = readConfig();
-              const client = new Limrun({ apiKey: cfg.apiKey, baseURL: cfg.apiEndpoint });
-              getBazelSetup(client).then(j => process.stdout.write(JSON.stringify(j))).catch(() => process.stdout.write("{}"));
-            ' || echo '{}')"
+              try {
+                const path = require("path"), cp = require("child_process");
+                const limRoot = path.join(cp.execSync("npm root -g", { encoding: "utf8" }).trim(), "lim");
+                const Limrun = require(path.join(limRoot, "node_modules/@limrun/api")).default;
+                const { readConfig } = require(path.join(limRoot, "dist/lib/config"));
+                const { getBazelSetup } = require(path.join(limRoot, "dist/lib/bazel-setup"));
+                const cfg = readConfig();
+                const client = new Limrun({ apiKey: cfg.apiKey, baseURL: cfg.apiEndpoint });
+                getBazelSetup(client).then(j => process.stdout.write(JSON.stringify(j))).catch(() => process.stdout.write("{}"));
+              } catch {
+                process.stdout.write("{}");
+              }
+            ')"
             RBE_ENDPOINT="$(node -e 'process.stdout.write(JSON.parse(require("fs").readFileSync(0, "utf8")).endpoint || "")' <<<"$SETUP_JSON")"
             RBE_INSTANCE="$(node -e 'process.stdout.write(JSON.parse(require("fs").readFileSync(0, "utf8")).instanceName || "")' <<<"$SETUP_JSON")"
             if [[ -n "$RBE_ENDPOINT" && -n "$CACHE_TOKEN" ]]; then
@@ -444,6 +529,7 @@ jobs:
                 --remote_header="Authorization=Bearer $CACHE_TOKEN"
                 --remote_upload_local_results=true
                 --remote_cache_compression
+                --remote_download_all
                 --remote_local_fallback=true
               )
             fi
@@ -457,6 +543,7 @@ jobs:
 
           env -C /tmp/LiteRT-LM bazelisk build \
             "${CACHE_FLAGS[@]}" \
+            --repository_cache="$HOME/.cache/bazel-repo" \
             --repo_env=GIT_LFS_SKIP_SMUDGE=1 \
             --config=macos_arm64 \
             -c opt \
@@ -612,7 +699,7 @@ jobs:
         with:
           node-version: 22
 
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '17'
@@ -629,45 +716,106 @@ jobs:
         with:
           key: windows-x86_64
 
+      - uses: actions/cache@v4
+        with:
+          path: ~/bazel-repo-cache
+          key: bazel-repo-windows-${{ needs.meta.outputs.upstream_ref }}
+          restore-keys: |
+            bazel-repo-windows-
+
       - uses: bazelbuild/setup-bazelisk@v3
-
-      - name: "Configure Windows Long Paths, tools, and short B drive"
-        shell: powershell
-        run: |
-          $ErrorActionPreference = "Stop"
-          Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem' -Name 'LongPathsEnabled' -Value 1
-          git config --system core.longpaths true
-          git lfs install
-          choco install make pkgconfiglite --no-progress -y
-          python -m pip install --quiet numpy
-
-          Add-Content -Path $env:GITHUB_PATH -Value "C:\Program Files\Git\cmd"
-          Add-Content -Path $env:GITHUB_PATH -Value "C:\Program Files\Git\bin"
-          Add-Content -Path $env:GITHUB_PATH -Value "C:\Program Files\Git\mingw64\bin"
-          Add-Content -Path $env:GITHUB_PATH -Value "$env:ALLUSERSPROFILE\chocolatey\bin"
-
-          $backing = if (Test-Path "D:\") { "D:\_lb" } else { "C:\_lb" }
-          New-Item -ItemType Directory -Path "$backing\t" -Force | Out-Null
-          New-Item -ItemType Directory -Path "$backing\b" -Force | Out-Null
-          subst B: $backing
-          Add-Content -Path $env:GITHUB_ENV -Value "TMP=B:\t"
-          Add-Content -Path $env:GITHUB_ENV -Value "TEMP=B:\t"
 
       - name: Setup MSVC x64 toolchain
         uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
 
-      - name: Patch MSVC Linker for Long Paths
-        shell: powershell
+      - name: "Configure Windows Long Paths, Developer Mode symlinks, MSYS2 tools, and short workspace"
+        shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
+          Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem' -Name 'LongPathsEnabled' -Value 1
+          New-Item -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock' -Force | Out-Null
+          Set-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock' -Name 'AllowDevelopmentWithoutDevLicense' -Value 1 -Type DWord
+          git config --system core.longpaths true
+          git lfs install
+
+          Add-Content -Path $env:GITHUB_PATH -Value "$env:ALLUSERSPROFILE\chocolatey\bin"
+          Add-Content -Path $env:GITHUB_PATH -Value "C:\Program Files\Git\cmd"
+          Add-Content -Path $env:GITHUB_PATH -Value "C:\Program Files\Git\mingw64\bin"
+          Add-Content -Path $env:GITHUB_PATH -Value "C:\Program Files\Git\bin"
+          Add-Content -Path $env:GITHUB_PATH -Value "C:\Program Files\Git\usr\bin"
+
+          $w = if (Test-Path "D:\") { "D:\w" } else { "C:\_w" }
+          if (Test-Path $w) { Remove-Item -Recurse -Force $w }
+          New-Item -ItemType Directory -Path "$w\t", "$w\b", "$w\pulled", "$HOME\bazel-repo-cache" -Force | Out-Null
+          Add-Content -Path $env:GITHUB_ENV -Value "WIN_WORK_ROOT=$w"
+          Add-Content -Path $env:GITHUB_ENV -Value "TMP=$w\t"
+          Add-Content -Path $env:GITHUB_ENV -Value "TEMP=$w\t"
+
+      - name: Install Limrun CLI and check Asset Storage for cached Windows archive
+        id: cache_check
+        shell: pwsh
+        env:
+          LIM_API_KEY: ${{ secrets.LIM_API_KEY }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $w = $env:WIN_WORK_ROOT
+          $upstreamRef = "${{ needs.meta.outputs.upstream_ref }}"
+          $shortRef = $upstreamRef.Substring(0, 12)
+          $forceRebuild = "${{ needs.meta.outputs.force_rebuild }}"
+          $assetName = "litert-lm-windows-x86_64-$shortRef.tar.gz"
+          $shaAssetName = "$assetName.sha256"
+
+          npm install -g lim --no-audit --no-fund
+          $hit = "false"
+          if ($env:LIM_API_KEY) {
+            lim set-api-key $env:LIM_API_KEY | Out-Null
+            lim version
+            if ($forceRebuild -ne "true") {
+              $items = @(lim asset list --name $assetName --json | ConvertFrom-Json)
+              if ($items.Count -gt 0 -and $items[0].id) {
+                $assetId = $items[0].id
+                lim asset pull $assetId -o "$w\pulled" | Out-Null
+                if ($LASTEXITCODE -eq 0 -and (Test-Path "$w\pulled\$assetName")) {
+                  $valid = $true
+                  $shaItems = @(lim asset list --name $shaAssetName --json | ConvertFrom-Json)
+                  if ($shaItems.Count -gt 0 -and $shaItems[0].id) {
+                    lim asset pull $shaItems[0].id -o "$w\pulled" | Out-Null
+                    if (Test-Path "$w\pulled\$shaAssetName") {
+                      $expected = (Get-Content "$w\pulled\$shaAssetName" -Raw).Trim().Split()[0].ToLowerInvariant()
+                      $actual = (Get-FileHash "$w\pulled\$assetName" -Algorithm SHA256).Hash.ToLowerInvariant()
+                      if ($expected -ne $actual) { $valid = $false }
+                    }
+                  }
+                  if ($valid) {
+                    Copy-Item "$w\pulled\$assetName" "$w\pulled\litert-lm-out.tar.gz" -Force
+                    $hit = "true"
+                    Write-Host "Restored verified Windows archive from Limrun Asset Storage ($assetName, $assetId)"
+                  }
+                }
+              }
+            }
+          }
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "hit=$hit"
+
+      - name: Patch MSVC Linker for Long Paths and install build tools
+        if: steps.cache_check.outputs.hit != 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          choco install make pkgconfiglite --no-progress -y
+          if ($LASTEXITCODE -ne 0) { throw "choco install failed" }
+          python -m pip install --quiet numpy
+          if ($LASTEXITCODE -ne 0) { throw "pip install numpy failed" }
+
+          $w = $env:WIN_WORK_ROOT
           $vcRoot = if ($env:BAZEL_VC) { $env:BAZEL_VC } else { "C:\Program Files\Microsoft Visual Studio\2022\*\VC" }
           $linkPath = (Get-ChildItem -Path "$vcRoot\Tools\MSVC\*\bin\HostX64\x64\link.exe" -ErrorAction SilentlyContinue | Sort-Object FullName -Descending | Select-Object -First 1).FullName
           if (-not $linkPath) {
             $linkPath = (Get-Command link.exe).Source
           }
-          $manifestPath = "B:\t\longpath.manifest"
+          $manifestPath = "$w\t\longpath.manifest"
           python scripts\win-helper.py write-manifest $manifestPath
           if ($LASTEXITCODE -ne 0) { throw "Failed to write longPathAware manifest" }
           $mtExe = (Get-ChildItem -Path "C:\Program Files (x86)\Windows Kits\10\bin\*\x64\mt.exe" -ErrorAction SilentlyContinue | Sort-Object FullName -Descending | Select-Object -First 1).FullName
@@ -676,73 +824,86 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "mt.exe failed to patch MSVC link.exe" }
 
       - name: Build Windows x86_64 LiteRT-LM C API DLL & import library (with Limrun RBE cache)
-        shell: powershell
+        if: steps.cache_check.outputs.hit != 'true'
+        shell: pwsh
         env:
           LIM_API_KEY: ${{ secrets.LIM_API_KEY }}
         run: |
           $ErrorActionPreference = "Stop"
+          $w = $env:WIN_WORK_ROOT
           $tag = "${{ needs.meta.outputs.tag }}"
           $commitSha = "${{ needs.meta.outputs.commit_sha }}"
           $upstreamRef = "${{ needs.meta.outputs.upstream_ref }}"
           $shortRef = $upstreamRef.Substring(0, 12)
+          $repoCache = "$HOME\bazel-repo-cache" -replace '\\', '/'
 
-          npm install -g lim --no-audit --no-fund
+          # Prepend Git MSYS2 tools ahead of C:\Windows\System32\bash.exe (WSL stub)
+          $gitTools = "C:\Program Files\Git\usr\bin;C:\Program Files\Git\bin;C:\Program Files\Git\mingw64\bin;C:\Program Files\Git\cmd"
+          $env:PATH = "$gitTools;$env:PATH"
+          $bashExe = (Get-Command bash.exe).Source
+          Write-Host "Using bash.exe: $bashExe"
+          if ($bashExe -like "*System32*") {
+            throw "bash.exe resolved to WSL stub ($bashExe) instead of Git MSYS2 bash"
+          }
+          & bash.exe -c "which bash sed patch grep tr awk && sed --version | head -n 1"
+          if ($LASTEXITCODE -ne 0) { throw "MSYS2 POSIX tool check failed" }
+
           $cacheFlags = @()
           if ($env:LIM_API_KEY) {
-            lim set-api-key $env:LIM_API_KEY | Out-Null
-            $cacheToken = (lim access-token create --permission 'remotecache:*:all' --permission 'remoteexecution:*:all' --ttl-seconds 7200 --quiet 2>$null)
-            $setupJson = node -e 'const path = require("path"); const limRoot = path.join(process.env.APPDATA, "npm/node_modules/lim"); const Limrun = require(path.join(limRoot, "node_modules/@limrun/api")).default; const { readConfig } = require(path.join(limRoot, "dist/lib/config")); const { getBazelSetup } = require(path.join(limRoot, "dist/lib/bazel-setup")); const cfg = readConfig(); const client = new Limrun({ apiKey: cfg.apiKey, baseURL: cfg.apiEndpoint }); getBazelSetup(client).then(j => process.stdout.write(JSON.stringify(j))).catch(() => process.stdout.write("{}"));'
+            $cacheToken = (lim access-token create --permission 'remotecache:*:all' --permission 'remoteexecution:*:all' --ttl-seconds 7200 --quiet)
+            $setupJson = node -e 'try { const path = require("path"), cp = require("child_process"); const limRoot = path.join(cp.execSync("npm root -g", { encoding: "utf8" }).trim(), "lim"); const Limrun = require(path.join(limRoot, "node_modules/@limrun/api")).default; const { readConfig } = require(path.join(limRoot, "dist/lib/config")); const { getBazelSetup } = require(path.join(limRoot, "dist/lib/bazel-setup")); const cfg = readConfig(); const client = new Limrun({ apiKey: cfg.apiKey, baseURL: cfg.apiEndpoint }); getBazelSetup(client).then(j => process.stdout.write(JSON.stringify(j))).catch(() => process.stdout.write("{}")); } catch { process.stdout.write("{}"); }'
             $setup = $setupJson | ConvertFrom-Json
             if ($setup.endpoint -and $cacheToken) {
+              Write-Host "Using Limrun RBE remote cache: $($setup.endpoint)"
               $cacheFlags = @(
                 "--remote_cache=$($setup.endpoint)",
                 "--remote_instance_name=$($setup.instanceName)",
                 "--remote_header=Authorization=Bearer $cacheToken",
                 "--remote_upload_local_results=true",
                 "--remote_cache_compression",
+                "--remote_download_all",
                 "--remote_local_fallback=true"
               )
             }
           }
 
           $env:GIT_LFS_SKIP_SMUDGE = "1"
-          git clone --no-checkout "https://github.com/google-ai-edge/LiteRT-LM.git" B:\src
-          git -C B:\src fetch --depth 1 origin $upstreamRef
-          git -C B:\src checkout -f FETCH_HEAD
+          git clone --no-checkout "https://github.com/google-ai-edge/LiteRT-LM.git" "$w\s"
+          if ($LASTEXITCODE -ne 0) { throw "git clone failed" }
+          git -C "$w\s" fetch --depth 1 origin $upstreamRef
+          if ($LASTEXITCODE -ne 0) { throw "git fetch failed" }
+          git -C "$w\s" checkout -f FETCH_HEAD
+          if ($LASTEXITCODE -ne 0) { throw "git checkout failed" }
           Remove-Item Env:GIT_LFS_SKIP_SMUDGE -ErrorAction SilentlyContinue
-          git -C B:\src lfs pull --include="prebuilt/windows_x86_64/*"
+          git -C "$w\s" lfs pull --include="prebuilt/windows_x86_64/*"
+          if ($LASTEXITCODE -ne 0) { throw "git lfs pull failed" }
 
-          Push-Location B:\src
+          Push-Location "$w\s"
           try {
-            & bazelisk --output_base="B:\b" build `
+            & bazelisk --output_base="$w\b" build `
               @cacheFlags `
+              --repository_cache="$repoCache" `
               --repo_env=GIT_LFS_SKIP_SMUDGE=1 `
-              --config=windows `
-              -c opt `
               --deleted_packages=swift `
-              --build_tag_filters=-nowindows,-android `
-              --action_env=TMP="B:\t" `
-              --action_env=TEMP="B:\t" `
+              --build_tag_filters=-nowindows `
+              --action_env=TMP="$w\t" `
+              --action_env=TEMP="$w\t" `
               //c:litert-lm
             if ($LASTEXITCODE -ne 0) { throw "Bazel build of //c:litert-lm failed with exit code $LASTEXITCODE" }
           } finally {
             Pop-Location
           }
 
-          New-Item -ItemType Directory -Force -Path B:\pkg, B:\pulled | Out-Null
-          Copy-Item "B:\src\bazel-bin\c\litert-lm.dll" "B:\pkg\litert-lm.dll" -Force
-          Copy-Item "B:\src\prebuilt\windows_x86_64\libGemmaModelConstraintProvider.dll" "B:\pkg\libGemmaModelConstraintProvider.dll" -Force
-          Copy-Item "B:\src\prebuilt\windows_x86_64\webgpu_dawn.dll" "B:\pkg\webgpu_dawn.dll" -Force
-          Copy-Item "B:\src\LICENSE" "B:\pkg\LICENSE" -Force
+          New-Item -ItemType Directory -Force -Path "$w\pkg", "$w\pulled" | Out-Null
+          python scripts\win-helper.py stage-built-dll "$w\s\bazel-bin\c" "$w\pkg\litert-lm.dll"
+          if ($LASTEXITCODE -ne 0) { throw "Failed to stage built litert-lm.dll" }
+          Copy-Item "$w\s\prebuilt\windows_x86_64\libGemmaModelConstraintProvider.dll" "$w\pkg\libGemmaModelConstraintProvider.dll" -Force
+          Copy-Item "$w\s\prebuilt\windows_x86_64\webgpu_dawn.dll" "$w\pkg\webgpu_dawn.dll" -Force
+          Copy-Item "$w\s\LICENSE" "$w\pkg\LICENSE" -Force
 
-          $libCandidate = Get-ChildItem -Path "B:\src\bazel-bin\c" -Filter "*.lib" -ErrorAction SilentlyContinue | Select-Object -First 1
-          if ($libCandidate) {
-            Copy-Item $libCandidate.FullName "B:\pkg\litert-lm.lib" -Force
-          } else {
-            python scripts\win-helper.py make-import-lib "B:\pkg\litert-lm.dll" "B:\t\litert-lm.def" "B:\pkg\litert-lm.lib"
-            if ($LASTEXITCODE -ne 0) { throw "Failed to generate import library litert-lm.lib" }
-          }
-          Copy-Item "B:\pkg\litert-lm.lib" "B:\pkg\litert-lm.if.lib" -Force
+          python scripts\win-helper.py make-import-lib "$w\pkg\litert-lm.dll" "$w\t\litert-lm.def" "$w\pkg\litert-lm.lib"
+          if ($LASTEXITCODE -ne 0) { throw "Failed to generate import library litert-lm.lib" }
+          Copy-Item "$w\pkg\litert-lm.lib" "$w\pkg\litert-lm.if.lib" -Force
 
           $buildInfo = @{
             repository = $env:GITHUB_REPOSITORY
@@ -752,38 +913,42 @@ jobs:
             upstream_sha = $upstreamRef
             target = "x86_64-pc-windows-msvc"
           } | ConvertTo-Json
-          [System.IO.File]::WriteAllText("B:\pkg\BUILD_INFO.json", $buildInfo + "`n")
+          [System.IO.File]::WriteAllText("$w\pkg\BUILD_INFO.json", $buildInfo + "`n")
 
-          tar.exe -czf "B:\pulled\litert-lm-out.tar.gz" -C "B:\pkg" .
+          $bsdtar = "$env:SystemRoot\System32\tar.exe"
+          & $bsdtar -czf "$w\pulled\litert-lm-out.tar.gz" -C "$w\pkg" .
           if ($LASTEXITCODE -ne 0) { throw "tar.exe failed" }
 
           if ($env:LIM_API_KEY) {
             $assetName = "litert-lm-windows-x86_64-$shortRef.tar.gz"
             $shaAssetName = "$assetName.sha256"
-            Copy-Item "B:\pulled\litert-lm-out.tar.gz" "B:\pulled\$assetName" -Force
-            $hash = (Get-FileHash "B:\pulled\$assetName" -Algorithm SHA256).Hash.ToLowerInvariant()
-            [System.IO.File]::WriteAllText("B:\pulled\$shaAssetName", "$hash  $assetName`n")
+            Copy-Item "$w\pulled\litert-lm-out.tar.gz" "$w\pulled\$assetName" -Force
+            $hash = (Get-FileHash "$w\pulled\$assetName" -Algorithm SHA256).Hash.ToLowerInvariant()
+            [System.IO.File]::WriteAllText("$w\pulled\$shaAssetName", "$hash  $assetName`n")
             foreach ($targetName in @($assetName, $shaAssetName)) {
-              $existing = (lim asset list --name $targetName --json 2>$null | ConvertFrom-Json)
+              $existing = @(lim asset list --name $targetName --json | ConvertFrom-Json)
               foreach ($item in $existing) {
-                if ($item.id) { lim asset delete $item.id 2>$null | Out-Null }
+                if ($item.id) { lim asset delete $item.id | Out-Null }
               }
             }
-            lim asset push "B:\pulled\$assetName" -n $assetName | Out-Null
-            lim asset push "B:\pulled\$shaAssetName" -n $shaAssetName | Out-Null
+            lim asset push "$w\pulled\$assetName" -n $assetName | Out-Null
+            lim asset push "$w\pulled\$shaAssetName" -n $shaAssetName | Out-Null
           }
 
       - name: Verify PE DLL exports, Cargo test suite, and zero-PATH DLL loading
-        shell: powershell
+        shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          New-Item -ItemType Directory -Force -Path B:\verify | Out-Null
-          tar.exe -xzf "B:\pulled\litert-lm-out.tar.gz" -C "B:\verify"
+          $w = $env:WIN_WORK_ROOT
+          $bsdtar = "$env:SystemRoot\System32\tar.exe"
+          New-Item -ItemType Directory -Force -Path "$w\verify" | Out-Null
+          & $bsdtar -xzf "$w\pulled\litert-lm-out.tar.gz" -C "$w\verify"
+          if ($LASTEXITCODE -ne 0) { throw "tar.exe extract failed" }
 
-          python scripts\win-helper.py verify-exports "src\bindings.rs" "B:\verify\litert-lm.dll"
+          python scripts\win-helper.py verify-exports "src\bindings.rs" "$w\verify\litert-lm.dll"
           if ($LASTEXITCODE -ne 0) { throw "C API symbol check failed" }
 
-          $env:LITERT_LM_LIB_DIR = "B:\verify"
+          $env:LITERT_LM_LIB_DIR = "$w\verify"
           cargo test --no-default-features
           if ($LASTEXITCODE -ne 0) { throw "cargo test failed" }
           cargo build --examples --no-default-features
@@ -797,9 +962,10 @@ jobs:
           }
 
       - name: Stage Windows release artifacts, SHA-256 sidecars, and SPDX 2.3 SBOM
-        shell: powershell
+        shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
+          $w = $env:WIN_WORK_ROOT
           $tag = "${{ needs.meta.outputs.tag }}"
           $version = "${{ needs.meta.outputs.version }}"
           $commitSha = "${{ needs.meta.outputs.commit_sha }}"
@@ -809,7 +975,7 @@ jobs:
 
           if (Test-Path dist) { Remove-Item -Recurse -Force dist }
           New-Item -ItemType Directory -Force -Path dist | Out-Null
-          Copy-Item "B:\pulled\litert-lm-out.tar.gz" "dist\$archive"
+          Copy-Item "$w\pulled\litert-lm-out.tar.gz" "dist\$archive"
           $files = @(
             "litert-lm.dll",
             "litert-lm.lib",
@@ -818,7 +984,7 @@ jobs:
             "webgpu_dawn.dll"
           )
           foreach ($f in $files) {
-            Copy-Item "B:\verify\$f" "dist\$f"
+            Copy-Item "$w\verify\$f" "dist\$f"
           }
           foreach ($f in (@($archive) + $files)) {
             $h = (Get-FileHash "dist\$f" -Algorithm SHA256).Hash.ToLowerInvariant()
@@ -842,6 +1008,9 @@ jobs:
       - build-windows-x86_64
     runs-on: ubuntu-latest
     timeout-minutes: 25
+    concurrency:
+      group: release-publish-${{ needs.meta.outputs.tag }}
+      cancel-in-progress: false
     permissions:
       contents: write
       id-token: write
