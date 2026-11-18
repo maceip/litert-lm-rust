@@ -768,8 +768,6 @@ jobs:
           Add-Content -Path $env:GITHUB_PATH -Value "$env:ALLUSERSPROFILE\chocolatey\bin"
           Add-Content -Path $env:GITHUB_PATH -Value "C:\Program Files\Git\cmd"
           Add-Content -Path $env:GITHUB_PATH -Value "C:\Program Files\Git\mingw64\bin"
-          Add-Content -Path $env:GITHUB_PATH -Value "C:\Program Files\Git\bin"
-          Add-Content -Path $env:GITHUB_PATH -Value "C:\Program Files\Git\usr\bin"
 
           $w = if (Test-Path "D:\") { "D:\w" } else { "C:\_w" }
           if (Test-Path $w) { Remove-Item -Recurse -Force $w }
@@ -863,7 +861,7 @@ jobs:
           $repoCache = "$HOME\bazel-repo-cache" -replace '\\', '/'
 
           $gitTools = "C:\Program Files\Git\usr\bin;C:\Program Files\Git\bin;C:\Program Files\Git\mingw64\bin;C:\Program Files\Git\cmd"
-          $env:PATH = "$gitTools;$env:PATH"
+          $env:PATH = "$env:PATH;$gitTools"
           # Verify Win32 CreateProcessW(NULL, "bash -c ...") directly (same search order as Bazel JVM)
           python -c "import subprocess, sys; r = subprocess.run(['bash', '-c', 'which bash sed patch grep tr awk && sed --version | head -n 1'], capture_output=True, text=True); print(r.stdout); sys.stderr.write(r.stderr); sys.exit(r.returncode)"
           if ($LASTEXITCODE -ne 0) { throw "Win32 CreateProcessW('bash') POSIX tool check failed" }
