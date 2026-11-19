@@ -1089,6 +1089,18 @@ unsafe extern "C" {
     ) -> LiteRtLmStatusCode;
 }
 unsafe extern "C" {
+    pub fn litert_lm_stream_chunk_get_finish_reason(
+        chunk: *const LiteRtLmStreamChunk,
+        out_finish_reason: *mut *const ::std::os::raw::c_char,
+    ) -> LiteRtLmStatusCode;
+}
+unsafe extern "C" {
+    pub fn litert_lm_stream_chunk_get_executor_stats_json(
+        chunk: *const LiteRtLmStreamChunk,
+        out_executor_stats_json: *mut *const ::std::os::raw::c_char,
+    ) -> LiteRtLmStatusCode;
+}
+unsafe extern "C" {
     pub fn litert_lm_conversation_render_message_to_string(
         conversation: *mut LiteRtLmConversation,
         message_json: *const ::std::os::raw::c_char,
